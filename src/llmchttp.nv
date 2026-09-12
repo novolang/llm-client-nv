@@ -1,0 +1,242 @@
+// llmchttp.nv — the transport, and the only module in this package
+// that touches a socket.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `LlmcTransport[e]` IS THE TRAIT THAT CROSSES THE LAYER.  Every
+// session call in `llmcchat` is generic over it and declares `[e]`, so
+// a call costs exactly what the caller's transport costs — and a test
+// drives a whole exchange over a recorded transcript at `[]`.
+//
+// TWO TRANSPORTS SHIP, AND THE DIFFERENCE IS THE PACKAGE'S EFFECT ROW:
+//
+//   `LlmcTlsHttp` IS `[net]`.  `std.tls` connects, sends and receives
+//   at `[net]` and nothing else, and http-codec-nv frames the request
+//   and drains the response at `[]`.  That is the narrow path, and it
+//   is what makes the package's headline row `[net, time]`.
+//
+//   `LlmcStdHttp` IS `[io, net, time, async]`.  `std.http`'s
+//   `HttpClient.send` declares all four — the async runtime is not
+//   optional on that surface — so a caller that wants redirects,
+//   connection reuse and the standard library's own chunked decoder
+//   pays those four labels on every function that touches it.
+//
+// PUBLISHING BOTH IS THE POINT.  A library that only offered the
+// second would have put `[async]` on the row of every program that
+// uses an LLM, including a synchronous batch job and an embedded-in-a-
+// CLI one-shot; a library that only offered the first would have made
+// every caller reimplement redirects.  The trait is what makes the
+// choice the caller's, and `tests/llmcchat_tests.nv` adds a third at
+// `[]` with no socket at all.
+//
+// STREAMING IS `llmc_open` PLUS `llmc_read`, NOT `llmc_exchange`.  A
+// server-sent event stream has no content length and is not finished
+// when the head is; a transport that buffered it would deliver the
+// whole reply at once, which is what `std.llm.stream` does on the
+// compiled leg and is exactly the behaviour this package exists to
+// replace.
+
+use llmcreq
+
+// One HTTP response, as much of it as a transport has.
+pub struct LlmcHttpReply
+    status: Int
+    // `Name: value` lines, as they arrived.  `header_of` is the
+    // case-insensitive lookup.
+    headers: [Str]
+    // The buffered body.  EMPTY when `streamed` is true, and a caller
+    // that read it instead of draining the stream gets nothing and no
+    // error.
+    body: [u8]
+    // True when the body was left on the wire for `llmc_read`.
+    streamed: Bool
+
+// A byte pipe one chat exchange can be driven over.
+//
+// `e` is the effect row the implementation supplies, and it is what
+// every call in `llmcchat` costs: `[net]` over TLS, `[io, net, time,
+// async]` over the standard library's HTTP client, and nothing at all
+// over a recorded transcript in a test.
+pub trait LlmcTransport[e]
+    // Send one request and buffer the whole response.
+    fn llmc_exchange(self, method: Str, path: Str, headers: [Str], body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [e]
+    // Send one request and stop after the head, leaving the body on
+    // the wire for `llmc_read`.  What a stream needs, and the reason
+    // the trait has four methods rather than one.
+    fn llmc_open(self, method: Str, path: Str, headers: [Str], body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [e]
+    // Up to `max` bytes of a body left on the wire.  An EMPTY answer
+    // means the peer closed — which, mid-stream, is
+    // `LlmcStreamTruncated` and not the end of a reply.
+    fn llmc_read(self, max: Int) -> Result<[u8], LlmcFault> [e]
+    // Close it.
+    fn llmc_close(self) -> ?LlmcFault [e]
+
+// A transport over the standard library's HTTP client.
+//
+// Redirects, connection reuse and chunked decoding come with it, and
+// so does `[io, net, time, async]`.
+pub struct LlmcStdHttp
+    client: HttpClient
+    base_url: Str
+
+// A transport over `std.tls` with http-codec-nv doing the framing.
+//
+// `[net]` and nothing else.  No redirects — a chat endpoint that
+// answered a 302 is a gateway misconfiguration and this one reports
+// it as the status it is.
+pub struct LlmcTlsHttp
+    conn: Int
+    host: Str
+    port: Int
+
+// A standard-library transport for a provider.
+//
+// Building one performs nothing; `llmc_exchange` is where the four
+// labels are spent.
+//
+// ```novo
+// use llmchttp
+// use llmcreq
+//
+// fn t(p: LlmcProvider) -> Bool
+//     match llmchttp.std_http(p, 30000)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn std_http(p: LlmcProvider, timeout_ms: Int) -> Result<LlmcStdHttp, LlmcFault> []
+    todo("llm-client-nv.llmchttp.std_http")
+
+// Dial a provider over TLS.
+//
+// `[net]`, which is `std.tls`'s own row and the narrowest way to reach
+// a hosted API from this package.
+//
+// ```novo ignore
+// use llmchttp
+// use llmcreq
+//
+// fn open(p: LlmcProvider) -> Result<LlmcTlsHttp, LlmcFault> [net]
+//     llmchttp.dial_tls(p, 30000)
+// ```
+pub fn dial_tls(p: LlmcProvider, timeout_ms: Int) -> Result<LlmcTlsHttp, LlmcFault> [net]
+    todo("llm-client-nv.llmchttp.dial_tls")
+
+// The host and port a provider's origin names.
+//
+// `[]` — parsing a URL is arithmetic.  Published because a caller that
+// wants to dial the socket itself, or to route through a proxy, needs
+// the two numbers and should not re-parse an origin this package
+// already understands.
+//
+// ```novo
+// use llmchttp
+// use llmcreq
+//
+// fn main() [io]
+//     match llmchttp.origin_of(llmcreq.openai("sk-test"))
+//         Ok(o)  => println("${o.port}")
+//         Err(_) => println("bad origin")
+//     // : 443
+// ```
+pub fn origin_of(p: LlmcProvider) -> Result<LlmcOrigin, LlmcFault> []
+    todo("llm-client-nv.llmchttp.origin_of")
+
+// A provider's origin, split.
+pub struct LlmcOrigin
+    scheme: Str
+    host: Str
+    port: Int
+
+// One header's value, matched without regard to case.
+//
+// HTTP field names are case-insensitive and providers disagree about
+// which case they send — `Retry-After` and `retry-after` both occur
+// from the same API — so a client that compared exactly reads the
+// limits from one deployment and not the next.
+//
+// ```novo
+// use llmchttp
+//
+// fn main() [io]
+//     match llmchttp.header_of(["Retry-After: 6"], "retry-after")
+//         Some(v) => println(v)
+//         None    => println("absent")
+//     // : 6
+// ```
+pub fn header_of(headers: [Str], name: Str) -> ?Str []
+    todo("llm-client-nv.llmchttp.header_of")
+
+// Whether a response is a server-sent event stream.
+//
+// `Content-Type: text/event-stream`.  A provider that answered JSON to
+// a streaming request did not refuse it — it ignored the field, which
+// several OpenAI-compatible servers do — and a client that drove the
+// stream reader over a single JSON document reads nothing and reports
+// a truncated stream.  This is the check that makes that legible.
+//
+// ```novo
+// use llmchttp
+//
+// fn main() [io]
+//     println("${llmchttp.is_event_stream(["Content-Type: text/event-stream"])}")
+//     // : true
+// ```
+pub fn is_event_stream(headers: [Str]) -> Bool []
+    todo("llm-client-nv.llmchttp.is_event_stream")
+
+// The standard library's HTTP client as a transport.
+//
+// `[io, net, time, async]` on every method, which is `HttpClient`'s
+// own row: the async runtime, the clock behind the deadline and the
+// `[io]` the socket layer declares all come with it.  A caller who
+// does not want those four uses `LlmcTlsHttp`.
+//
+// ```novo ignore
+// use llmcchat
+// use llmchttp
+//
+// fn ask(c: LlmcClient, t: LlmcStdHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [io, net, time, async]
+//     llmcchat.send(c, t, r)
+// ```
+impl LlmcTransport[io, net, time, async] for LlmcStdHttp
+    fn llmc_exchange(self, method: Str, path: Str, headers: [Str],
+                     body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [io, net, time, async]
+        todo("llm-client-nv.llmchttp.LlmcStdHttp.llmc_exchange")
+
+    fn llmc_open(self, method: Str, path: Str, headers: [Str],
+                 body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [io, net, time, async]
+        todo("llm-client-nv.llmchttp.LlmcStdHttp.llmc_open")
+
+    fn llmc_read(self, max: Int) -> Result<[u8], LlmcFault> [io, net, time, async]
+        todo("llm-client-nv.llmchttp.LlmcStdHttp.llmc_read")
+
+    fn llmc_close(self) -> ?LlmcFault [io, net, time, async]
+        todo("llm-client-nv.llmchttp.LlmcStdHttp.llmc_close")
+
+// TLS plus http-codec-nv as a transport.
+//
+// `[net]` on every method, which is `std.tls`'s own row: the framing
+// is http-codec-nv's and costs nothing, so this is the narrowest path
+// to a hosted API the package has.
+//
+// ```novo ignore
+// use llmcchat
+// use llmchttp
+//
+// fn ask(c: LlmcClient, t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net]
+//     llmcchat.send(c, t, r)
+// ```
+impl LlmcTransport[net] for LlmcTlsHttp
+    fn llmc_exchange(self, method: Str, path: Str, headers: [Str],
+                     body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [net]
+        todo("llm-client-nv.llmchttp.LlmcTlsHttp.llmc_exchange")
+
+    fn llmc_open(self, method: Str, path: Str, headers: [Str],
+                 body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [net]
+        todo("llm-client-nv.llmchttp.LlmcTlsHttp.llmc_open")
+
+    fn llmc_read(self, max: Int) -> Result<[u8], LlmcFault> [net]
+        todo("llm-client-nv.llmchttp.LlmcTlsHttp.llmc_read")
+
+    fn llmc_close(self) -> ?LlmcFault [net]
+        todo("llm-client-nv.llmchttp.LlmcTlsHttp.llmc_close")

@@ -1,0 +1,185 @@
+// llmcsse_tests.nv — the streamed reply, with no socket in the file.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// llm-client-nv.<module>.<fn>`.
+//
+// A whole stream is a byte array here, which is `llmcsse`'s claim
+// working: the reader is feed-and-drain and `[]`, so the loop that
+// would have been a socket is a `for` over three chunks.
+
+use std.test
+use std.bytes
+use std.list
+use llmcopenai
+use llmcanthro
+use llmcreply
+use llmcsse
+
+fn chunk(text: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(text))
+
+@test
+fn test_a_frame_ends_at_a_blank_line_and_not_at_a_newline() [io]
+    // A `data:` line is one line of a frame.  A reader that emitted
+    // per line splits one JSON document into pieces and reports the
+    // first as malformed.
+    let wire = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n"
+
+    match llmcsse.feed(llmcsse.reader(), chunk(wire))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match s.frame
+                None    => test.assert(false)
+                Some(f) =>
+                    test.case("one frame, with both lines in it")
+                    test.assert(f.event == "content_block_delta")
+                    test.assert(f.data == "{\"type\":\"content_block_delta\"}")
+
+@test
+fn test_two_data_lines_join_with_a_newline() [io]
+    // The specification's rule, and the one a provider uses for a
+    // multi-line payload.
+    let wire = "data: one\ndata: two\n\n"
+
+    match llmcsse.feed(llmcsse.reader(), chunk(wire))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match s.frame
+                None    => test.assert(false)
+                Some(f) => test.assert(f.data == "one\ntwo")
+
+@test
+fn test_a_frame_split_across_reads_is_one_frame() [io]
+    // Which is the whole reason the reader is feed-and-drain: a socket
+    // read ends where the network chose.
+    var r = llmcsse.reader()
+    var seen = 0
+
+    match llmcsse.feed(r, chunk("data: {\"a\":"))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            r = s.reader
+            test.case("half a frame completes nothing")
+            match s.frame
+                Some(_) => test.assert(false)
+                None    => test.assert(true)
+
+    match llmcsse.feed(r, chunk("1}\n\n"))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            r = s.reader
+            match s.frame
+                None    => test.assert(false)
+                Some(f) =>
+                    seen = seen + 1
+                    test.case("and the rest of it completes one")
+                    test.assert(f.data == "{\"a\":1}")
+
+    test.assert(seen == 1)
+
+@test
+fn test_the_done_sentinel_is_not_json() [io]
+    // `data: [DONE]` is the OpenAI dialect's terminator.  A reader
+    // that parsed every frame reports a malformed reply at the end of
+    // every SUCCESSFUL stream.
+    match llmcsse.feed(llmcsse.reader(), chunk("data: [DONE]\n\n"))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match s.frame
+                None    => test.assert(false)
+                Some(f) =>
+                    test.case("the reader recognises it")
+                    test.assert(llmcsse.is_done(f))
+
+                    test.case("and the dialect answers no events rather than an error")
+                    match llmcopenai.events_of_frame(f)
+                        Err(_) => test.assert(false)
+                        Ok(es) => test.assert(list.len(es) == 0)
+
+@test
+fn test_tool_arguments_accumulate_as_text_across_frames() [io]
+    // There is a point in every tool-calling stream at which the
+    // accumulated arguments are `{"city": "Cope`.  A reader that
+    // parsed each delta reports malformed JSON for most of the stream.
+    var acc = llmcsse.stream()
+    acc = llmcsse.apply(acc, LlmcEventToolStart(0, "call_a", "get_weather"))
+    acc = llmcsse.apply(acc, LlmcEventToolArgs(0, "{\"city\": \"Cope"))
+
+    test.case("mid-stream the arguments are not valid JSON, and that is fine")
+    let partial = llmcsse.partial(acc)
+    test.assert(list.len(partial.tool_calls) == 1)
+
+    acc = llmcsse.apply(acc, LlmcEventToolArgs(0, "nhagen\"}"))
+    acc = llmcsse.apply(acc, LlmcEventStop(LlmcStopToolUse))
+
+    match llmcsse.finish(acc)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            match llmcreply.call_by_id(r, "call_a")
+                None    => test.assert(false)
+                Some(c) =>
+                    test.case("and at the end they are one string, parsed once")
+                    test.assert(c.arguments == "{\"city\": \"Copenhagen\"}")
+
+@test
+fn test_a_stream_that_ends_with_no_terminal_event_is_truncated() [io]
+    // The connection dropped, the deadline fired, the proxy cut it —
+    // and the text so far reads exactly like an answer.
+    var acc = llmcsse.stream()
+    acc = llmcsse.apply(acc, LlmcEventText("The capital of Denmark is Cope"))
+
+    test.case("it has not finished")
+    test.assert(llmcsse.finished(acc) == false)
+
+    test.case("so finish refuses rather than answering a plausible reply")
+    match llmcsse.finish(acc)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and showing it anyway is a named decision")
+    test.assert(llmcsse.partial(acc).text == "The capital of Denmark is Cope")
+
+@test
+fn test_a_ping_carries_nothing_and_appends_nothing() [io]
+    var acc = llmcsse.stream()
+    acc = llmcsse.apply(acc, LlmcEventText("hi"))
+    acc = llmcsse.apply(acc, LlmcEventPing)
+
+    test.case("a keep-alive is not content")
+    test.assert(llmcsse.partial(acc).text == "hi")
+
+@test
+fn test_the_two_dialects_frame_their_events_differently() [io]
+    // Anthropic names every frame in the `event:` field; the OpenAI
+    // dialect names none and puts the discriminator in the data.
+    let anth = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"
+
+    match llmcsse.feed(llmcsse.reader(), chunk(anth))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match s.frame
+                None    => test.assert(false)
+                Some(f) =>
+                    match llmcanthro.events_of_frame(f)
+                        Err(_) => test.assert(false)
+                        Ok(es) =>
+                            test.case("a named terminal frame is one stop event")
+                            test.assert(list.len(es) == 1)
+
+@test
+fn test_a_frame_larger_than_the_limit_is_refused_rather_than_buffered() [io]
+    // A stream that never blanks a line is a stream that buffers until
+    // the process dies, and the peer decides how much it sends.
+    let r = llmcsse.reader_with(16)
+
+    match llmcsse.feed(r, chunk("data: 0123456789abcdefghijklmnop"))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_reader_holds_nothing_it_has_finished_with() [io]
+    // Asserted directly rather than trusted from a paragraph.
+    match llmcsse.feed(llmcsse.reader(), chunk("data: a\n\n"))
+        Err(_) => test.assert(false)
+        Ok(s)  => test.assert(llmcsse.pending_len(s.reader) == 0)

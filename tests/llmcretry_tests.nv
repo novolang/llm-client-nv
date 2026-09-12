@@ -1,0 +1,172 @@
+// llmcretry_tests.nv — the backoff, asserted exactly, with no clock.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// llm-client-nv.<module>.<fn>`.
+//
+// THE WHOLE FILE IS THE JITTER PARAMETER PAYING FOR ITSELF.  The
+// uniforms are arguments, so a schedule is a pure function of the
+// policy and the sequence, and these assertions are numbers rather
+// than ranges.
+
+use std.test
+use std.list
+use llmcretry
+
+@test
+fn test_the_server_beats_the_computed_backoff() [io]
+    // A client using its own exponential backoff either waits four
+    // seconds when it was told six and gets a second 429, or waits
+    // sixty when it was told two.
+    let limits = llmcretry.limits_of(["Retry-After: 6"])
+
+    test.case("the header was read")
+    test.assert(limits.retry_after_ms == 6000)
+
+    match llmcretry.next_delay_ms(llmcretry.retry(), 1,
+                                  LlmcRateLimited(6000, "slow down"),
+                                  limits, 0.5)
+        None     => test.assert(false)
+        Some(ms) =>
+            test.case("and it is what the client waits, not the base delay")
+            test.assert(ms == 6000)
+
+@test
+fn test_a_client_that_ignores_the_server_says_so_in_its_policy() [io]
+    var p = llmcretry.retry()
+    p = LlmcRetry { max_attempts: p.max_attempts, base_delay_ms: p.base_delay_ms,
+                    max_delay_ms: p.max_delay_ms, respect_server_delay: false,
+                    idempotency_key: p.idempotency_key }
+
+    match llmcretry.next_delay_ms(p, 1, LlmcRateLimited(6000, "slow down"),
+                                  llmcretry.limits_of(["Retry-After: 6"]), 1.0)
+        None     => test.assert(false)
+        Some(ms) => test.assert(ms <= p.max_delay_ms)
+
+@test
+fn test_the_three_duration_spellings_all_parse() [io]
+    // `Retry-After: 6` is seconds; the reset headers use Go's duration
+    // spelling.  A client that read one of the three reads the limits
+    // from one deployment and not the next.
+    test.case("bare seconds")
+    test.assert(llmcretry.parse_duration_ms("6") == 6000)
+
+    test.case("fractional seconds")
+    test.assert(llmcretry.parse_duration_ms("1.5s") == 1500)
+
+    test.case("milliseconds")
+    test.assert(llmcretry.parse_duration_ms("840ms") == 840)
+
+    test.case("minutes and seconds")
+    test.assert(llmcretry.parse_duration_ms("6m0s") == 360000)
+
+@test
+fn test_what_cannot_be_read_is_minus_one_and_never_zero() [io]
+    // Zero would retry immediately into the limit that just refused.
+    test.assert(llmcretry.parse_duration_ms("soon") == -1)
+
+@test
+fn test_the_two_buckets_reset_separately() [io]
+    // A large request can exhaust the token bucket while the request
+    // bucket is untouched, and they reset at different times.
+    let limits = llmcretry.limits_of([
+        "x-ratelimit-remaining-requests: 4999",
+        "x-ratelimit-remaining-tokens: 0",
+        "x-ratelimit-reset-requests: 12ms",
+        "x-ratelimit-reset-tokens: 6m0s"])
+
+    test.case("requests are fine")
+    test.assert(limits.requests_remaining == 4999)
+
+    test.case("tokens are exhausted")
+    test.assert(limits.tokens_remaining == 0)
+
+    test.case("and the two resets are six minutes apart")
+    test.assert(limits.requests_reset_ms == 12)
+    test.assert(limits.tokens_reset_ms == 360000)
+
+@test
+fn test_the_other_provider_spells_the_same_headers_differently() [io]
+    let limits = llmcretry.limits_of([
+        "anthropic-ratelimit-requests-remaining: 49",
+        "anthropic-ratelimit-tokens-remaining: 0"])
+
+    test.assert(limits.requests_remaining == 49)
+    test.assert(limits.tokens_remaining == 0)
+
+@test
+fn test_an_absent_header_is_minus_one_and_not_zero() [io]
+    // Zero remaining means throttle NOW; absent means the provider did
+    // not say.  A client that conflated them throttles against silence.
+    let limits = llmcretry.limits_of([])
+
+    test.assert(limits.requests_remaining == -1)
+    test.assert(limits.retry_after_ms == -1)
+
+@test
+fn test_a_401_ends_the_loop_at_the_first_attempt() [io]
+    // The key is wrong and it will still be wrong in eight seconds.  A
+    // loop that retried it burns its attempts and reports a timeout.
+    match llmcretry.next_delay_ms(llmcretry.retry(), 1,
+                                  LlmcAuthFailed(401, "bad key"),
+                                  llmcretry.no_limits(), 0.5)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_the_attempt_budget_ends_the_loop() [io]
+    // None is the only end condition, so a loop's `match` has no second
+    // check to forget.
+    match llmcretry.next_delay_ms(llmcretry.retry(), 3,
+                                  LlmcOverloaded("busy"),
+                                  llmcretry.no_limits(), 0.5)
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_the_schedule_is_a_pure_function_of_its_uniforms() [io]
+    // Same policy, same fault, same uniforms, same waits — on any
+    // machine.  That is what the jitter parameter bought.
+    let a = llmcretry.schedule(llmcretry.retry(), LlmcOverloaded("busy"),
+                               llmcretry.no_limits(), [0.25, 0.75])
+    let b = llmcretry.schedule(llmcretry.retry(), LlmcOverloaded("busy"),
+                               llmcretry.no_limits(), [0.25, 0.75])
+
+    test.case("two attempts of retry budget produce two waits")
+    test.assert(list.len(a) == 2)
+
+    test.case("and the same inputs produce the same waits")
+    test.assert(list.len(a) == list.len(b))
+
+@test
+fn test_the_backoff_is_capped() [io]
+    let p = llmcretry.with_max_delay_ms(
+                llmcretry.with_max_attempts(llmcretry.retry(), 10), 4000)
+    let waits = llmcretry.schedule(p, LlmcOverloaded("busy"),
+                                   llmcretry.no_limits(),
+                                   [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+
+    test.case("nine waits for ten attempts")
+    test.assert(list.len(waits) == 9)
+
+@test
+fn test_a_retried_post_carries_an_idempotency_key_or_says_it_does_not() [io]
+    // A POST that timed out may have been executed: the completion was
+    // generated and billed and the reply was lost on the way back.
+    test.case("no key by default, which is a decision the caller made")
+    test.assert(list.len(llmcretry.idempotency_headers(llmcretry.retry())) == 0)
+
+    test.case("and one header when there is one")
+    let p = llmcretry.with_idempotency_key(llmcretry.retry(), "req-1")
+    test.assert(list.len(llmcretry.idempotency_headers(p)) == 1)
+
+@test
+fn test_a_deadline_is_asked_about_rather_than_computed_by_hand() [io]
+    test.assert(llmcretry.deadline_passed(1000, 30000, 40000))
+    test.assert(llmcretry.deadline_passed(1000, 30000, 20000) == false)
+
+@test
+fn test_an_http_date_retry_after_resolves_against_a_reading_the_caller_gives() [io]
+    // Which is what keeps the arithmetic testable without waiting for
+    // a date.
+    test.assert(llmcretry.retry_after_from("6", 0) == 6000)

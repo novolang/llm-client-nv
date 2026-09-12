@@ -1,0 +1,324 @@
+// llmcopenai.nv — the OpenAI-compatible chat dialect.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// THIS MODULE IS `core`-SHAPED INSIDE A `host` PACKAGE and every row
+// in it is `[]`.  A dialect is a function from a request value to a
+// JSON value and from a JSON value back to a reply; nothing here
+// opens a socket, and `tests/llmcopenai_tests.nv` asserts a whole
+// exchange with no server in it.
+//
+// There is no `llm-codec-nv` row on the grid, and this module is why
+// one is not asked for: the two dialects are a few hundred lines of
+// object building each, they exist only to be spoken by this client,
+// and a package whose README said "this builds `{"model": …}`" is not
+// one anybody browses to.  If a server ever wants the same shapes —
+// a proxy, a recorder, a local endpoint pretending to be OpenAI —
+// this module lifts out unchanged, because nothing in it performs.
+//
+// WHAT THIS DIALECT IS.  `POST /v1/chat/completions`, a flat
+// `messages` array, `choices[0].message` in the reply, `tool_calls` on
+// the assistant message and `role: "tool"` messages carrying results.
+// Spoken by OpenAI, Groq, together.ai, Fireworks, vLLM, llama.cpp's
+// server, LM Studio, Ollama's `/v1` endpoint and most gateways — which
+// is why it is the dialect a `compatible` provider gets by default.
+//
+// THE THREE THINGS A WRONG OPENAI CLIENT GETS WRONG QUIETLY, each an
+// assertion in the tests:
+//
+//   A TOOL RESULT IS A MESSAGE WITH `tool_call_id`, NOT A NAME.  Two
+//   calls to one tool in one turn produce two results that differ only
+//   by id, and a client that matched on `name` answers the first call
+//   twice.
+//
+//   `finish_reason: "length"` IS NOT AN ERROR AND IS NOT A SUCCESS.
+//   The status is 200, `content` is a string, and the answer is half
+//   of one.  `llmcreply.is_complete` is the check; this module's job
+//   is only to carry the reason out.
+//
+//   `stream_options: {"include_usage": true}` IS THE ONLY WAY USAGE
+//   ARRIVES ON A STREAM.  Without it the last frame before `[DONE]`
+//   has `usage: null` and a metering program silently records zero for
+//   every streamed call it makes.  `encode_request` sets it whenever
+//   `stream` is true, and the README says so.
+
+use std.json
+use std.list
+use llmcfault
+use llmcreq
+use llmcreply
+use llmcsse
+
+// OpenAI's own origin.
+pub const LLMC_OPENAI_BASE_URL = "https://api.openai.com"
+
+// The chat endpoint's path, appended to the provider's origin.
+pub const LLMC_OPENAI_CHAT_PATH = "/v1/chat/completions"
+
+// The sentinel the stream's last frame carries instead of JSON.
+//
+// `data: [DONE]` — which is NOT a JSON document, and a reader that fed
+// every frame to a parser reports a malformed reply at the end of
+// every successful stream.  `llmcsse.is_done` is the check.
+pub const LLMC_OPENAI_DONE = "[DONE]"
+
+// The whole request body, as a JSON value.
+//
+// Calls `llmcreq.check` first, so a request this dialect cannot speak
+// is refused here rather than as a provider's 400.
+//
+// ```novo
+// use llmcopenai
+// use llmcreq
+// use promptmsg
+//
+// fn body(r: LlmcRequest, p: LlmcProvider) -> Bool
+//     match llmcopenai.encode_request(p, r)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_request(p: LlmcProvider, r: LlmcRequest) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcopenai.encode_request")
+
+// The same body, serialised.
+//
+// ```novo
+// use llmcopenai
+// use llmcreq
+//
+// fn bytes(p: LlmcProvider, r: LlmcRequest) -> Str
+//     match llmcopenai.encode_body(p, r)
+//         Ok(s)  => s
+//         Err(_) => ""
+// ```
+pub fn encode_body(p: LlmcProvider, r: LlmcRequest) -> Result<Str, LlmcFault> []
+    todo("llm-client-nv.llmcopenai.encode_body")
+
+// One prompt-nv message as this dialect's message object.
+//
+// A `PromptTool` message becomes `{"role": "tool", "tool_call_id": …,
+// "content": …}` — the id and not the name, for the reason the module
+// header gives.
+//
+// ```novo
+// use llmcopenai
+// use promptmsg
+//
+// fn one(m: PromptMessage) -> Bool
+//     match llmcopenai.encode_message(m)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_message(m: PromptMessage) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcopenai.encode_message")
+
+// The whole conversation as this dialect's `messages` array.
+//
+// The system message stays IN the array here, first — which is the
+// difference from the Anthropic dialect, where it is a top-level
+// field.
+//
+// ```novo
+// use llmcopenai
+// use promptmsg
+//
+// fn many(c: PromptConvo) -> Bool
+//     match llmcopenai.encode_messages(c)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_messages(c: PromptConvo) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcopenai.encode_messages")
+
+// One tool definition as `{"type": "function", "function": {…}}`.
+//
+// ```novo
+// use llmcopenai
+// use llmcreq
+// use std.json
+//
+// fn main() [io]
+//     let t = llmcreq.tool("now", "the time", json.object([]))
+//     println(json.type_of(llmcopenai.encode_tool(t)))
+//     // : object
+// ```
+pub fn encode_tool(t: LlmcToolDef) -> JsonValueH []
+    todo("llm-client-nv.llmcopenai.encode_tool")
+
+// A tool choice as this dialect's `tool_choice`.
+//
+// `"auto"`, `"none"`, `"required"`, or the object form naming one
+// function.
+//
+// ```novo
+// use llmcopenai
+// use llmcreq
+// use std.json
+//
+// fn main() [io]
+//     println(json.type_of(llmcopenai.encode_tool_choice(LlmcToolAuto)))
+//     // : string
+// ```
+pub fn encode_tool_choice(c: LlmcToolChoice) -> JsonValueH []
+    todo("llm-client-nv.llmcopenai.encode_tool_choice")
+
+// A response format as this dialect's `response_format`.
+//
+// `LlmcFormatJson` becomes `{"type": "json_object"}` and
+// `LlmcFormatSchema` becomes `{"type": "json_schema", "json_schema":
+// {"name": …, "schema": …, "strict": …}}`.
+//
+// `strict` is a PROVIDER'S PROMISE and not a proof.  OpenAI's own
+// endpoint constrains decoding; several servers that accept this
+// dialect accept the field and prompt for it instead, which is the
+// difference between a shape that cannot be wrong and one that usually
+// is not.  `llmcchat.validate_format` is why schema-nv is a dependency
+// of this package rather than a suggestion in the README.
+//
+// ```novo
+// use llmcopenai
+// use llmcreq
+//
+// fn fmt() -> Bool
+//     match llmcopenai.encode_format(LlmcFormatJson)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_format(f: LlmcFormat) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcopenai.encode_format")
+
+// The assistant turn as this dialect writes it, with the tool calls
+// intact.
+//
+// The LOSSLESS form of a model turn, for a caller replaying a
+// transcript: `llmcreply.to_messages` goes through prompt-nv's message
+// and drops the arguments, and this does not.
+//
+// ```novo
+// use llmcopenai
+// use llmcreply
+// use std.json
+//
+// fn main() [io]
+//     println(json.type_of(llmcopenai.assistant_turn(llmcreply.empty_reply())))
+//     // : object
+// ```
+pub fn assistant_turn(r: LlmcReply) -> JsonValueH []
+    todo("llm-client-nv.llmcopenai.assistant_turn")
+
+// One tool result as this dialect's message.
+//
+// `{"role": "tool", "tool_call_id": …, "content": …}`.  The id comes
+// from the call, never from the tool's name.
+//
+// ```novo
+// use llmcopenai
+// use std.json
+//
+// fn main() [io]
+//     let m = llmcopenai.tool_result_message("call_abc", "17 degrees")
+//     println(json.type_of(m))
+//     // : object
+// ```
+pub fn tool_result_message(call_id: Str, content: Str) -> JsonValueH []
+    todo("llm-client-nv.llmcopenai.tool_result_message")
+
+// A buffered 200 body as a reply.
+//
+// ```novo
+// use llmcopenai
+//
+// fn read(body: Str) -> Bool
+//     match llmcopenai.decode_reply(body)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn decode_reply(body: Str) -> Result<LlmcReply, LlmcFault> []
+    todo("llm-client-nv.llmcopenai.decode_reply")
+
+// The same, from a value a caller already parsed.
+//
+// ```novo
+// use llmcopenai
+// use std.json
+//
+// fn read(v: JsonValueH) -> Bool
+//     match llmcopenai.decode_value(v)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn decode_value(v: JsonValueH) -> Result<LlmcReply, LlmcFault> []
+    todo("llm-client-nv.llmcopenai.decode_value")
+
+// The `usage` object, or every field zero when there was none.
+//
+// Never fails: a missing usage is a provider that does not report one,
+// which is a fact about the provider and not an error in the reply.
+//
+// ```novo
+// use llmcopenai
+// use std.json
+//
+// fn main() [io]
+//     println("${llmcopenai.decode_usage(json.object([])).input_tokens}")
+//     // : 0
+// ```
+pub fn decode_usage(v: JsonValueH) -> LlmcUsage []
+    todo("llm-client-nv.llmcopenai.decode_usage")
+
+// A non-2xx status and its body as a fault.
+//
+// Reads `error.code` into `provider_code` and `error.message` into the
+// message, and falls back to the raw body for a server that answered
+// text — which a gateway in front of a real provider very often does.
+//
+// ```novo
+// use llmcopenai
+// use llmcfault
+//
+// fn main() [io]
+//     let f = llmcopenai.decode_error(429, "")
+//     println("${llmcfault.is_retryable(f)}")
+//     // : true
+// ```
+pub fn decode_error(status: Int, body: Str) -> LlmcFault []
+    todo("llm-client-nv.llmcopenai.decode_error")
+
+// One SSE frame as the events it carries.
+//
+// A LIST, because one `chat.completion.chunk` frame can carry a text
+// delta, the start of a tool call and a finish reason at once.  The
+// `[DONE]` sentinel answers an empty list rather than an error: it is
+// a frame with no content, and `llmcsse.is_done` is what ends the
+// loop.
+//
+// ```novo
+// use llmcopenai
+// use llmcsse
+//
+// fn events(f: LlmcSseFrame) -> Bool
+//     match llmcopenai.events_of_frame(f)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn events_of_frame(f: LlmcSseFrame) -> Result<[LlmcEvent], LlmcFault> []
+    todo("llm-client-nv.llmcopenai.events_of_frame")
+
+// Whether a model name is one this dialect's `/v1/models` would list.
+//
+// A shape check and nothing more — no network, no table of names that
+// would be stale in a month.  What it refuses is the mistake that
+// produces a 404 reading like a bad key: a provider-qualified id
+// (`openai:gpt-4o-mini`) sent where a bare model name belongs.
+// `std.llm` takes the qualified form and this package does not, which
+// is the one naming difference between the two surfaces.
+//
+// ```novo
+// use llmcopenai
+//
+// fn main() [io]
+//     println("${llmcopenai.is_model_name("openai:gpt-4o-mini")}")
+//     // : false
+// ```
+pub fn is_model_name(name: Str) -> Bool []
+    todo("llm-client-nv.llmcopenai.is_model_name")

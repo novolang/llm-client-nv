@@ -1,0 +1,214 @@
+// llmcfault.nv — why a request did not produce a reply.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout.  A fault is a value built from a status code, a
+// response body and a header list the caller already holds.
+//
+// WHY THERE IS AN ERROR TYPE AT ALL, AND NOT A `?Str`.  `std.llm`
+// answers `?Str` from `ask`, `chat` and `embed`, and its own page says
+// what that costs: the same `None` stands for a server that was
+// unreachable, a server that answered an error status, a server that
+// answered an empty body and a transport that broke.  `last_error`
+// was added to carry the missing half, and it is PROCESS-WIDE — one
+// buffer shared by every handle and every provider, which two
+// concurrent requests overwrite for each other.
+//
+// The four failures a retry loop has to tell apart are the ones a
+// single `None` collapses:
+//
+//   A 401 IS NEVER WORTH RETRYING.  The key is wrong and it will
+//   still be wrong in eight seconds; a loop that retried it burns its
+//   attempts and reports a timeout.
+//
+//   A 429 IS ALWAYS WORTH RETRYING, and the delay is usually IN THE
+//   RESPONSE.  `llmcretry.limits_of` reads it; a loop that used its
+//   own backoff instead either waits too long or hammers a limiter
+//   that told it exactly when to come back.
+//
+//   A 400 IS THE CALLER'S OWN REQUEST, and retrying it produces the
+//   same 400 at the same price.  `provider_code` carries the
+//   provider's own machine-readable name for it —
+//   `context_length_exceeded`, `invalid_request_error` — because the
+//   sentence beside it is prose that changes without notice.
+//
+//   A 529 FROM ANTHROPIC AND A 503 FROM ANYBODY are the server saying
+//   "not now", which is retryable and is NOT a bad request even
+//   though both are failures.
+//
+// EVERY VARIANT CARRIES THE PROVIDER'S OWN WORDS.  A library that
+// mapped a provider's error onto a tidy enum and threw the message
+// away leaves its user with "bad request" against an API whose actual
+// answer named the parameter.
+
+// Why a request did not produce a reply.
+//
+// One variant per decision a caller makes.  `is_retryable` is the
+// decision itself; the payloads are what a log line and a bug report
+// need.
+pub enum LlmcFault
+    // The request was refused as malformed or unacceptable — 400, 404,
+    // 413, 422.  `provider_code` is the provider's own name for it
+    // (`context_length_exceeded`, `invalid_request_error`), empty when
+    // it sent none.  NOT retryable: the same bytes get the same answer.
+    LlmcBadRequest(status: Int, provider_code: Str, message: Str)
+    // 401 or 403.  The key is missing, wrong, revoked, or does not
+    // carry the scope the call needs.  Never retryable.
+    LlmcAuthFailed(status: Int, message: Str)
+    // 429.  `retry_after_ms` is what the response ASKED for, or -1
+    // when it named no delay and the caller's own backoff decides.
+    LlmcRateLimited(retry_after_ms: Int, message: Str)
+    // 500, 502, 503, 504 — the server failed.  Retryable.
+    LlmcServerError(status: Int, message: Str)
+    // Anthropic's 529, and any provider's "we are at capacity".
+    // Separate from `LlmcServerError` because it is the one failure
+    // whose right answer is a LONGER wait rather than a faster retry.
+    LlmcOverloaded(message: Str)
+    // The transport itself failed — no connection, a broken pipe, a
+    // TLS handshake that did not complete.  Retryable, with the
+    // caveat `is_retryable`'s doc comment states about a POST.
+    LlmcTransportFailed(message: Str)
+    // No reply within the caller's deadline.  `elapsed_ms` is how long
+    // it waited, so a log line says which deadline was hit.
+    LlmcTimedOut(elapsed_ms: Int)
+    // A 2xx whose body was not the shape the dialect promises — a
+    // missing `choices`, a `content` that is not a list, a truncated
+    // JSON document.  `what` names the path that was missing.
+    LlmcMalformedReply(what: Str)
+    // A stream that ended with no terminal event.  Its own variant
+    // rather than a `LlmcMalformedReply`, because the text accumulated
+    // so far LOOKS like an answer and is half of one.
+    LlmcStreamTruncated(received_chars: Int)
+    // The request asks for something this dialect has no spelling for
+    // — a `seed` to Anthropic, a tool choice a server does not
+    // implement.  Refused before a byte travels, naming both.
+    LlmcUnsupported(feature: Str, dialect: Str)
+    // The request as written cannot be encoded: Anthropic requires
+    // `max_tokens` and the request has none, a tool result answers a
+    // call id no assistant turn made, two tools share a name.
+    LlmcBadEncoding(what: Str)
+    // The rendered request is larger than the limit the caller gave
+    // `llmcreq.check_budget`.  Local, before the round trip, and the
+    // numbers are the estimate the README qualifies.
+    LlmcBudgetExceeded(wanted: Int, limit: Int)
+
+// Whether trying the same request again could produce a different
+// answer.
+//
+// TRUE for `LlmcRateLimited`, `LlmcServerError`, `LlmcOverloaded`,
+// `LlmcTransportFailed` and `LlmcTimedOut`; false for everything else.
+//
+// The caveat this answer does NOT carry, and which `llmcretry`'s
+// idempotency key exists for: a POST that timed out may have been
+// EXECUTED.  The completion was generated and billed, and the reply
+// was lost on the way back; retrying it generates and bills a second
+// one.  That is why `LlmcRetry.idempotency_key` is a field rather than
+// a convenience, and why `llmcretry.idempotency_headers` is what a
+// retry loop sends.
+//
+// ```novo
+// use llmcfault
+//
+// fn main() [io]
+//     println("${llmcfault.is_retryable(LlmcAuthFailed(401, "bad key"))}")
+//     // : false
+// ```
+pub fn is_retryable(f: LlmcFault) -> Bool []
+    todo("llm-client-nv.llmcfault.is_retryable")
+
+// Whether the fault is in the request the caller wrote.
+//
+// A program's own bug, rather than the network's or the provider's:
+// `LlmcBadRequest`, `LlmcAuthFailed`, `LlmcUnsupported`,
+// `LlmcBadEncoding` and `LlmcBudgetExceeded`.  What a caller logs at a
+// level that wakes somebody.
+//
+// ```novo
+// use llmcfault
+//
+// fn main() [io]
+//     println("${llmcfault.is_caller_error(LlmcBadEncoding("no max_tokens"))}")
+//     // : true
+// ```
+pub fn is_caller_error(f: LlmcFault) -> Bool []
+    todo("llm-client-nv.llmcfault.is_caller_error")
+
+// The rule every `LlmcFault` is printed by: name the decision, then
+// quote the provider verbatim.
+//
+// `Result<T, E>` requires `E: Error` (SPEC § 3.4), so this impl is what
+// makes every fallible signature in the package spellable.  It carries
+// a body on an interface release because a panic reporting a fault
+// through a `todo()` would print the wrong sentence.
+//
+// ```novo ignore
+// use llmcfault
+//
+// fn why(f: LlmcFault) -> Str
+//     f.message()
+// ```
+impl Error for LlmcFault
+    fn message(self) -> Str
+        match self
+            LlmcBadRequest(status, code, why) => "${status} ${code}: ${why}"
+            LlmcAuthFailed(status, why)       => "${status} the key was refused: ${why}"
+            LlmcRateLimited(after, why)       => "429 rate limited, retry after ${after} ms: ${why}"
+            LlmcServerError(status, why)      => "${status} the server failed: ${why}"
+            LlmcOverloaded(why)               => "the provider is at capacity: ${why}"
+            LlmcTransportFailed(why)          => "the request never completed: ${why}"
+            LlmcTimedOut(elapsed)             => "no reply within ${elapsed} ms"
+            LlmcMalformedReply(what)          => "the reply had no ${what}"
+            LlmcStreamTruncated(got)          => "the stream ended after ${got} characters with no terminal event"
+            LlmcUnsupported(feature, dialect) => "${dialect} has no spelling for ${feature}"
+            LlmcBadEncoding(what)             => "the request cannot be encoded: ${what}"
+            LlmcBudgetExceeded(want, limit)   => "${want} tokens against a budget of ${limit}"
+
+// The HTTP status behind the fault, or 0 for the ones that never
+// reached a server.
+//
+// ```novo
+// use llmcfault
+//
+// fn main() [io]
+//     println("${llmcfault.status_of(LlmcRateLimited(2000, "slow down"))}")
+//     // : 429
+// ```
+pub fn status_of(f: LlmcFault) -> Int []
+    todo("llm-client-nv.llmcfault.status_of")
+
+// The fault a status code alone implies, before a dialect has read
+// the body.
+//
+// The mapping every dialect shares: 401 and 403 authenticate, 429
+// rate-limits, 529 overloads, 5xx is a server error, everything else
+// outside 2xx is a bad request.  Each dialect calls this and then
+// REPLACES the message and the provider code from its own error body,
+// which is the part the two do not share.
+//
+// ```novo
+// use llmcfault
+//
+// fn main() [io]
+//     println("${llmcfault.status_of(llmcfault.of_status(503, "unavailable"))}")
+//     // : 503
+// ```
+pub fn of_status(status: Int, message: Str) -> LlmcFault []
+    todo("llm-client-nv.llmcfault.of_status")
+
+// The same fault with a delay the response asked for.
+//
+// Applied by `llmcretry.limits_of` after the headers are read, so
+// `LlmcRateLimited(-1, …)` becomes `LlmcRateLimited(2000, …)` and a
+// retry loop that honours the server needs no second value beside the
+// fault.
+//
+// ```novo
+// use llmcfault
+//
+// fn main() [io]
+//     let f = llmcfault.with_retry_after(llmcfault.of_status(429, "slow down"), 2000)
+//     println("${llmcfault.status_of(f)}")
+//     // : 429
+// ```
+pub fn with_retry_after(f: LlmcFault, retry_after_ms: Int) -> LlmcFault []
+    todo("llm-client-nv.llmcfault.with_retry_after")

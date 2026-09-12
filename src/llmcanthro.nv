@@ -1,0 +1,364 @@
+// llmcanthro.nv — Anthropic's Messages dialect.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `core`-shaped inside a `host` package, like `llmcopenai`: every row
+// here is `[]` and a whole exchange is a byte array in a test.
+//
+// WHAT IS DIFFERENT FROM THE OTHER DIALECT, which is the whole reason
+// this is a second module and not a flag:
+//
+//   THE SYSTEM PROMPT IS A TOP-LEVEL FIELD, not the first message.  A
+//   client that sent `{"role": "system"}` in the array gets a 400
+//   naming the role, so `encode_messages` LIFTS it out and
+//   `encode_system` is the half that answers it.
+//
+//   `max_tokens` IS REQUIRED.  There is no default, and the request is
+//   refused without it.  `llmcreq.check` is where that is caught,
+//   before the bytes leave.
+//
+//   CONTENT IS A BLOCK LIST IN BOTH DIRECTIONS.  An assistant turn is
+//   `[{"type": "text", …}, {"type": "tool_use", …}]`, so text and
+//   tool calls INTERLEAVE, and a model that said "let me look that
+//   up" and then called a tool produced one turn with two blocks.  The
+//   OpenAI dialect has `content` and `tool_calls` as separate fields
+//   and loses the order; `LlmcReply` keeps the text and the calls
+//   apart because that is the shape both can be read as, and this
+//   module's `blocks_of` is published for the caller that needs the
+//   interleaving back.
+//
+//   A TOOL RESULT IS A `user` MESSAGE, not a role of its own.  Its
+//   content is a `tool_result` block carrying `tool_use_id`.  A client
+//   that invented a `"tool"` role here gets a 400; one that sent the
+//   result as plain user text gets an answer, and the answer is the
+//   model guessing, because nothing tied the text to the call.
+//
+//   THE ERROR BODY IS `{"type": "error", "error": {"type": …}}`, and
+//   the codes are Anthropic's own — `overloaded_error` is 529, which
+//   is the one status whose right answer is a LONGER wait rather than
+//   a faster retry, and `llmcfault.LlmcOverloaded` exists for it.
+//
+//   THE STREAM NAMES ITS FRAMES.  `message_start`,
+//   `content_block_start`, `content_block_delta`, `content_block_stop`,
+//   `message_delta`, `message_stop`, `ping` — so `events_of_frame`
+//   reads the `event:` field here and reads inside the data on the
+//   other dialect.  Usage arrives on `message_delta` WITHOUT being
+//   asked for, which the other dialect does not do.
+
+use std.json
+use std.list
+use llmcfault
+use llmcreq
+use llmcreply
+
+// Anthropic's own origin.
+pub const LLMC_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+
+// The Messages endpoint's path.
+pub const LLMC_ANTHROPIC_CHAT_PATH = "/v1/messages"
+
+// The `anthropic-version` this package was written against.
+//
+// A constant rather than a default buried in a constructor, because it
+// pins the RESPONSE shape: a client that sent a different one is
+// reading fields this module's decoders do not expect.
+pub const LLMC_ANTHROPIC_VERSION = "2023-06-01"
+
+// The whole request body, as a JSON value.
+//
+// Calls `llmcreq.check` first, which is where a missing `max_tokens`
+// and a `seed` this dialect cannot spell are refused.
+//
+// ```novo
+// use llmcanthro
+// use llmcreq
+//
+// fn body(p: LlmcProvider, r: LlmcRequest) -> Bool
+//     match llmcanthro.encode_request(p, r)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_request(p: LlmcProvider, r: LlmcRequest) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcanthro.encode_request")
+
+// The same body, serialised.
+//
+// ```novo
+// use llmcanthro
+// use llmcreq
+//
+// fn bytes(p: LlmcProvider, r: LlmcRequest) -> Str
+//     match llmcanthro.encode_body(p, r)
+//         Ok(s)  => s
+//         Err(_) => ""
+// ```
+pub fn encode_body(p: LlmcProvider, r: LlmcRequest) -> Result<Str, LlmcFault> []
+    todo("llm-client-nv.llmcanthro.encode_body")
+
+// The conversation's system message as this dialect's top-level
+// `system` field, or empty.
+//
+// ```novo
+// use llmcanthro
+// use promptmsg
+//
+// fn main() [io]
+//     println(llmcanthro.encode_system(promptmsg.empty_convo()))
+//     // :
+// ```
+pub fn encode_system(c: PromptConvo) -> Str []
+    todo("llm-client-nv.llmcanthro.encode_system")
+
+// The conversation's body as this dialect's `messages` array, with the
+// system message LIFTED OUT.
+//
+// A system message left in the array is a 400 naming the role, which
+// is the first thing a client ported from the other dialect hits.
+//
+// ```novo
+// use llmcanthro
+// use promptmsg
+//
+// fn many(c: PromptConvo) -> Bool
+//     match llmcanthro.encode_messages(c)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_messages(c: PromptConvo) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcanthro.encode_messages")
+
+// One prompt-nv message as this dialect's message object.
+//
+// A `PromptTool` message becomes a `user` message whose single content
+// block is a `tool_result` carrying `tool_use_id` — not a role of its
+// own, which this dialect has no spelling for.
+//
+// ```novo
+// use llmcanthro
+// use promptmsg
+//
+// fn one(m: PromptMessage) -> Bool
+//     match llmcanthro.encode_message(m)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_message(m: PromptMessage) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcanthro.encode_message")
+
+// One tool definition as `{"name": …, "description": …,
+// "input_schema": …}`.
+//
+// `input_schema` and not `parameters`, and no `{"type": "function"}`
+// wrapper — the two dialects spell the same facts differently, which
+// is most of what these modules are.
+//
+// ```novo
+// use llmcanthro
+// use llmcreq
+// use std.json
+//
+// fn main() [io]
+//     let t = llmcreq.tool("now", "the time", json.object([]))
+//     println(json.type_of(llmcanthro.encode_tool(t)))
+//     // : object
+// ```
+pub fn encode_tool(t: LlmcToolDef) -> JsonValueH []
+    todo("llm-client-nv.llmcanthro.encode_tool")
+
+// A tool choice as this dialect's `tool_choice` object.
+//
+// `{"type": "auto"}`, `{"type": "none"}`, `{"type": "any"}` —
+// `any` and not `required`, which is the spelling difference a client
+// ported across gets a 400 for — or `{"type": "tool", "name": …}`.
+//
+// ```novo
+// use llmcanthro
+// use llmcreq
+// use std.json
+//
+// fn main() [io]
+//     println(json.type_of(llmcanthro.encode_tool_choice(LlmcToolRequired)))
+//     // : object
+// ```
+pub fn encode_tool_choice(c: LlmcToolChoice) -> JsonValueH []
+    todo("llm-client-nv.llmcanthro.encode_tool_choice")
+
+// A response format, as far as this dialect has one.
+//
+// This API has no `response_format` field.  Structured output is
+// obtained by offering ONE tool whose input schema is the shape and
+// forcing it with `tool_choice`, which is the documented approach and
+// what this encodes — so `LlmcFormatSchema` becomes a tool named for
+// the schema, and the reply's tool-call arguments are the JSON.
+// `llmcchat.decode` puts them back in `text` so a caller that asked
+// for a shape reads it in the same place under either dialect.
+//
+// `LlmcFormatJson` with no schema is `LlmcUnsupported`, named:
+// "valid JSON, unspecified shape" has no spelling here at all, and a
+// client that quietly dropped the request would return prose to a
+// caller that will parse it.
+//
+// ```novo
+// use llmcanthro
+// use llmcreq
+//
+// fn fmt() -> Bool
+//     match llmcanthro.encode_format(LlmcFormatJson)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_format(f: LlmcFormat) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcanthro.encode_format")
+
+// The assistant turn as this dialect writes it, blocks and all.
+//
+// The lossless form, for a caller replaying a transcript: text and
+// tool-use blocks in the order the model produced them.
+//
+// ```novo
+// use llmcanthro
+// use llmcreply
+// use std.json
+//
+// fn main() [io]
+//     println(json.type_of(llmcanthro.assistant_turn(llmcreply.empty_reply())))
+//     // : object
+// ```
+pub fn assistant_turn(r: LlmcReply) -> JsonValueH []
+    todo("llm-client-nv.llmcanthro.assistant_turn")
+
+// One tool result as this dialect's `user` message.
+//
+// `is_error` is a FIELD on the block and not an exception, because a
+// tool that failed is something the MODEL must see: a loop that hid
+// the failure and sent nothing gets the same call again, and a loop
+// that raised gets a program that cannot recover from a transient
+// tool.
+//
+// ```novo
+// use llmcanthro
+// use std.json
+//
+// fn main() [io]
+//     let m = llmcanthro.tool_result_message("toolu_1", "17 degrees", false)
+//     println(json.type_of(m))
+//     // : object
+// ```
+pub fn tool_result_message(call_id: Str, content: Str, is_error: Bool) -> JsonValueH []
+    todo("llm-client-nv.llmcanthro.tool_result_message")
+
+// A buffered 200 body as a reply.
+//
+// ```novo
+// use llmcanthro
+//
+// fn read(body: Str) -> Bool
+//     match llmcanthro.decode_reply(body)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn decode_reply(body: Str) -> Result<LlmcReply, LlmcFault> []
+    todo("llm-client-nv.llmcanthro.decode_reply")
+
+// The same, from a value a caller already parsed.
+//
+// ```novo
+// use llmcanthro
+// use std.json
+//
+// fn read(v: JsonValueH) -> Bool
+//     match llmcanthro.decode_value(v)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn decode_value(v: JsonValueH) -> Result<LlmcReply, LlmcFault> []
+    todo("llm-client-nv.llmcanthro.decode_value")
+
+// The content blocks of a reply, in the order they arrived.
+//
+// Published because `LlmcReply` keeps text and tool calls apart and
+// this dialect INTERLEAVES them: a model that explained itself between
+// two tool calls produced three blocks, and a transcript that wants to
+// show that needs the order.  The common reader does not.
+//
+// ```novo
+// use llmcanthro
+// use std.json
+//
+// fn blocks(v: JsonValueH) -> Int
+//     list.len(llmcanthro.blocks_of(v))
+// ```
+pub fn blocks_of(v: JsonValueH) -> [JsonValueH] []
+    todo("llm-client-nv.llmcanthro.blocks_of")
+
+// The `usage` object, or every field zero.
+//
+// This dialect reports `cache_creation_input_tokens` and
+// `cache_read_input_tokens` separately; the read count lands in
+// `cached_input_tokens` and the creation count does not, because it is
+// billed at a PREMIUM rather than a discount and a caller adding it to
+// the cached total would compute a cost that is wrong in the cheap
+// direction.
+//
+// ```novo
+// use llmcanthro
+// use std.json
+//
+// fn main() [io]
+//     println("${llmcanthro.decode_usage(json.object([])).output_tokens}")
+//     // : 0
+// ```
+pub fn decode_usage(v: JsonValueH) -> LlmcUsage []
+    todo("llm-client-nv.llmcanthro.decode_usage")
+
+// A non-2xx status and its body as a fault.
+//
+// Reads `error.type` into `provider_code`, and answers
+// `LlmcOverloaded` for 529 — this API's own "at capacity" status,
+// which is not a server error and whose right answer is a longer wait.
+//
+// ```novo
+// use llmcanthro
+// use llmcfault
+//
+// fn main() [io]
+//     println("${llmcfault.is_retryable(llmcanthro.decode_error(529, ""))}")
+//     // : true
+// ```
+pub fn decode_error(status: Int, body: Str) -> LlmcFault []
+    todo("llm-client-nv.llmcanthro.decode_error")
+
+// One SSE frame as the events it carries.
+//
+// Reads the `event:` field, which this dialect sets on every frame.
+// `ping` answers `[LlmcEventPing]` and never an empty list, so a
+// caller counting frames and a caller counting events agree.
+//
+// ```novo
+// use llmcanthro
+// use llmcsse
+//
+// fn events(f: LlmcSseFrame) -> Bool
+//     match llmcanthro.events_of_frame(f)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn events_of_frame(f: LlmcSseFrame) -> Result<[LlmcEvent], LlmcFault> []
+    todo("llm-client-nv.llmcanthro.events_of_frame")
+
+// Whether a model name is one this dialect accepts.
+//
+// A shape check: a bare name, not `anthropic:claude-…`.  The same
+// refusal `llmcopenai.is_model_name` makes, and for the same reason —
+// `std.llm` takes the provider-qualified form and this package does
+// not.
+//
+// ```novo
+// use llmcanthro
+//
+// fn main() [io]
+//     println("${llmcanthro.is_model_name("claude-haiku-4-5")}")
+//     // : true
+// ```
+pub fn is_model_name(name: Str) -> Bool []
+    todo("llm-client-nv.llmcanthro.is_model_name")

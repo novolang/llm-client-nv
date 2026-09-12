@@ -1,0 +1,193 @@
+// llmcreply_tests.nv — the two ways a reply is not what it looks like.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented: llm-client-nv.<module>.<fn>`.
+// That is the expected result until the bodies land.
+//
+// NO SOCKET IN THIS FILE, AND THAT IS THE PACKAGE'S CLAIM WORKING.
+// Both dialect modules and this one are `core`-shaped: every row is
+// `[]`, so a provider's whole response body is a string a test writes
+// out and a reply is what comes back from it.
+//
+// The bodies below are the shapes the two APIs document, trimmed to
+// the fields this package reads.
+
+use std.test
+use std.list
+use llmcopenai
+use llmcanthro
+use llmcreply
+
+@test
+fn test_a_reply_that_hit_the_token_cap_is_a_prefix_and_says_so() [io]
+    // 200, a string in `content`, and an answer that stops mid
+    // sentence.  A client answering `?Str` hands this to its caller
+    // with nothing to distinguish it from a whole reply.
+    let body = "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"The capital of Denmark is Cope\"},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":8,\"total_tokens\":26}}"
+
+    match llmcopenai.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the text arrived")
+            test.assert(r.text == "The capital of Denmark is Cope")
+
+            test.case("and it is not a whole answer")
+            test.assert(llmcreply.is_truncated(r))
+
+            test.case("which is the one call an application has to make")
+            test.assert(llmcreply.is_complete(r.stop) == false)
+
+@test
+fn test_the_same_truncation_in_the_other_dialect() [io]
+    let body = "{\"id\":\"msg_1\",\"model\":\"claude-haiku-4-5\",\"stop_reason\":\"max_tokens\",\"content\":[{\"type\":\"text\",\"text\":\"The capital of Denmark is Cope\"}],\"usage\":{\"input_tokens\":18,\"output_tokens\":8}}"
+
+    match llmcanthro.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("one enum, two spellings")
+            test.assert(llmcreply.is_truncated(r))
+
+@test
+fn test_a_tool_call_turn_leaves_an_obligation_the_next_request_must_meet() [io]
+    // `content` is null, `tool_calls` is the turn, and the next
+    // request must carry a result for every id in it — Anthropic
+    // refuses without one, and the other dialect lets the model answer
+    // as though the tool returned nothing.
+    let body = "{\"id\":\"chatcmpl-2\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Copenhagen\\\"}\"}},{\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Oslo\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}"
+
+    match llmcopenai.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the model asked for tools")
+            test.assert(llmcreply.wants_tools(r))
+
+            test.case("twice, to the same tool")
+            test.assert(list.len(r.tool_calls) == 2)
+
+            test.case("and two obligations are owed, one per call id")
+            test.assert(list.len(llmcreply.owed_tool_results(r)) == 2)
+
+            test.case("which is what a loop keyed on the tool NAME gets wrong")
+            let owed = llmcreply.owed_tool_results(r)
+            test.assert(list.len(owed) == 2)
+
+@test
+fn test_tool_arguments_come_back_as_text_and_parse_in_one_call() [io]
+    let body = "{\"id\":\"chatcmpl-3\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Copenhagen\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}"
+
+    match llmcopenai.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            match llmcreply.call_by_id(r, "call_a")
+                None    => test.assert(false)
+                Some(c) =>
+                    test.case("the arguments are the provider's own text")
+                    test.assert(c.arguments == "{\"city\": \"Copenhagen\"}")
+
+                    test.case("and parse once, at the end")
+                    match llmcreply.arguments_json(c)
+                        Ok(_)  => test.assert(true)
+                        Err(_) => test.assert(false)
+
+@test
+fn test_truncated_tool_arguments_fail_to_parse_and_the_stop_says_why() [io]
+    // The cap fired mid-arguments.  The JSON is unclosed, and without
+    // `stop` a caller reports it as the model producing bad JSON.
+    let body = "{\"id\":\"chatcmpl-4\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\": \\\"Cope\"}}]},\"finish_reason\":\"length\"}]}"
+
+    match llmcopenai.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the reply is truncated")
+            test.assert(llmcreply.is_truncated(r))
+
+            match llmcreply.call_by_id(r, "call_a")
+                None    => test.assert(false)
+                Some(c) =>
+                    test.case("and the arguments do not parse, for that reason")
+                    match llmcreply.arguments_json(c)
+                        Ok(_)  => test.assert(false)
+                        Err(_) => test.assert(true)
+
+@test
+fn test_a_stop_sequence_reports_which_one_fired() [io]
+    // A request with three stop sequences is usually one whose next
+    // step depends on which ended it.  Most clients drop this.
+    let body = "{\"id\":\"msg_2\",\"model\":\"claude-haiku-4-5\",\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"</answer>\",\"content\":[{\"type\":\"text\",\"text\":\"42\"}]}"
+
+    match llmcanthro.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("a stop sequence is a complete reply")
+            test.assert(llmcreply.is_complete(r.stop))
+
+            match r.stop
+                LlmcStopSequence(which) =>
+                    test.case("and the sequence that fired is carried")
+                    test.assert(which == "</answer>")
+                _                       => test.assert(false)
+
+@test
+fn test_the_model_that_answered_is_not_always_the_one_requested() [io]
+    // An alias resolves to a dated snapshot.  A program comparing runs
+    // needs the one that answered.
+    let body = "{\"id\":\"chatcmpl-5\",\"model\":\"gpt-4o-mini-2024-07-18\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}"
+
+    match llmcopenai.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the reply names the snapshot")
+            test.assert(r.model == "gpt-4o-mini-2024-07-18")
+
+@test
+fn test_usage_separates_the_cached_input_from_the_total() [io]
+    // Cached input is billed at a fraction and is INCLUDED in the
+    // input count.  A caller costing a call needs both numbers.
+    let body = "{\"id\":\"msg_3\",\"model\":\"claude-haiku-4-5\",\"stop_reason\":\"end_turn\",\"content\":[{\"type\":\"text\",\"text\":\"ok\"}],\"usage\":{\"input_tokens\":1200,\"output_tokens\":10,\"cache_read_input_tokens\":1024}}"
+
+    match llmcanthro.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the input count is the whole input")
+            test.assert(r.usage.input_tokens == 1200)
+
+            test.case("and the cached part is named beside it")
+            test.assert(r.usage.cached_input_tokens == 1024)
+
+            test.case("so the total is not a sum of the two")
+            test.assert(llmcreply.total_tokens(r.usage) == 1210)
+
+@test
+fn test_a_filtered_reply_is_a_reply_and_not_an_error() [io]
+    let body = "{\"id\":\"chatcmpl-6\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":\"content_filter\"}]}"
+
+    match llmcopenai.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("it decoded rather than erroring")
+            test.assert(llmcreply.is_complete(r.stop) == false)
+
+            test.case("and there is a sentence to show a person")
+            test.assert(llmcreply.stop_note(r.stop) != "")
+
+@test
+fn test_an_unknown_finish_reason_does_not_break_a_client_that_wanted_the_text() [io]
+    let body = "{\"id\":\"chatcmpl-7\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":\"something_new\"}]}"
+
+    match llmcopenai.decode_reply(body)
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the text is there")
+            test.assert(r.text == "hi")
+
+            match r.stop
+                LlmcStopOther(raw) =>
+                    test.case("and the reason travels verbatim")
+                    test.assert(raw == "something_new")
+                _                  => test.assert(false)
+
+@test
+fn test_a_two_hundred_with_no_choices_is_a_malformed_reply() [io]
+    match llmcopenai.decode_reply("{\"id\":\"chatcmpl-8\"}")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

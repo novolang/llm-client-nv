@@ -1,0 +1,408 @@
+// llmcreply.nv — what came back, and the two ways it is not what it
+// looks like.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout.  A reply is a value both dialects decode into.
+//
+// **THIS MODULE IS THE LOAD-BEARING INTERFACE OF THE PACKAGE.**
+//
+// `std.llm` answers `?Str`.  So does `openai-python`'s convenience
+// accessor, and so does almost every thin wrapper anybody writes over
+// either.  A `Str` cannot be in the two states a chat reply is most
+// often in, and both of them are INVISIBLE in the text:
+//
+//   A REPLY THAT HIT THE TOKEN CAP IS A TRUNCATED ANSWER WITH NO
+//   MARKER IN IT.  `finish_reason: "length"` on one side and
+//   `stop_reason: "max_tokens"` on the other say so; the text itself
+//   ends mid-sentence, or worse, ends at a sentence boundary that
+//   happened to fall there.  A summariser that stored it stored half a
+//   summary.  A structured-output call that hit the cap produced JSON
+//   with no closing brace, and the parse failure is reported against
+//   the model's competence rather than against the caller's
+//   `max_tokens`.
+//
+//   A REPLY THAT IS A TOOL CALL HAS NO TEXT AT ALL, and the
+//   conversation is now in a state the caller must discharge: the very
+//   next request has to carry a result for EVERY call id the model
+//   emitted.  Anthropic refuses the next request outright when one is
+//   missing.  The OpenAI dialect accepts it and the model answers as
+//   though the tool had returned nothing, which is the worse of the
+//   two failures because it produces a plausible sentence with no
+//   error anywhere.
+//
+// So `LlmcReply` carries `stop`, `text`, `tool_calls` and `usage`
+// together, `is_complete` is one call, and `owed_tool_results` is
+// PUBLISHED — the list of call ids the next request must answer —
+// so an agent loop asserts the obligation instead of remembering it.
+// `llmcreq.check` is the other end of the same rule: it refuses a
+// request whose conversation leaves an obligation open, before the
+// bytes go out.
+
+use std.list
+use promptmsg
+
+// Why a reply ended.
+//
+// Both dialects' vocabulary mapped onto one enum, because the
+// DECISIONS are the same in both and the spellings are not:
+// `finish_reason` is `stop` / `length` / `tool_calls` /
+// `content_filter`, and `stop_reason` is `end_turn` / `max_tokens` /
+// `tool_use` / `stop_sequence` / `refusal`.
+pub enum LlmcStop
+    // The model finished what it was saying.  The only variant for
+    // which `text` is a whole answer.
+    LlmcStopEnd
+    // The reply hit the token cap.  TRUNCATED: what is in `text` is a
+    // prefix, and a caller that stored it stored a prefix.
+    LlmcStopMaxTokens
+    // The model asked for one or more tools.  `text` is usually empty
+    // and `tool_calls` is what the turn was; the next request must
+    // answer every id in it.
+    LlmcStopToolUse
+    // A stop sequence the request supplied fired.  `which` is the one
+    // that did, which is the part a caller needs and which most
+    // clients drop — a request with three stop sequences is usually a
+    // request whose next step depends on which one ended it.
+    LlmcStopSequence(which: Str)
+    // The provider's safety layer stopped the reply, or the model
+    // declined.  `reason` is whatever the provider named it.  Its own
+    // variant rather than an error: this IS a reply and the caller
+    // usually wants to show something.
+    LlmcStopFiltered(reason: Str)
+    // A spelling this package does not know, carried verbatim.  Not an
+    // error: a provider that adds a reason should not break a client
+    // that only wanted the text.
+    LlmcStopOther(raw: Str)
+
+// Whether the text is a whole answer.
+//
+// TRUE only for `LlmcStopEnd` and `LlmcStopSequence`.  The one call an
+// application should make before it stores, indexes, displays or
+// parses a reply, and the reason this enum exists.
+//
+// ```novo
+// use llmcreply
+//
+// fn main() [io]
+//     println("${llmcreply.is_complete(LlmcStopMaxTokens)}")
+//     // : false
+// ```
+pub fn is_complete(s: LlmcStop) -> Bool []
+    todo("llm-client-nv.llmcreply.is_complete")
+
+// One sentence a program can show a person when `is_complete` is
+// false.
+//
+// Written once here rather than in every application, because the
+// sentence a user needs — "the answer was cut off at the length
+// limit" — is not one a caller can derive from a variant name.
+//
+// ```novo
+// use llmcreply
+//
+// fn main() [io]
+//     println(llmcreply.stop_note(LlmcStopMaxTokens))
+// ```
+pub fn stop_note(s: LlmcStop) -> Str []
+    todo("llm-client-nv.llmcreply.stop_note")
+
+// The OpenAI dialect's `finish_reason`, as a stop.
+//
+// ```novo
+// use llmcreply
+//
+// fn main() [io]
+//     println("${llmcreply.is_complete(llmcreply.stop_of_openai("length"))}")
+//     // : false
+// ```
+pub fn stop_of_openai(raw: Str) -> LlmcStop []
+    todo("llm-client-nv.llmcreply.stop_of_openai")
+
+// The Anthropic dialect's `stop_reason`, as a stop.
+//
+// ```novo
+// use llmcreply
+//
+// fn main() [io]
+//     println("${llmcreply.is_complete(llmcreply.stop_of_anthropic("end_turn"))}")
+//     // : true
+// ```
+pub fn stop_of_anthropic(raw: Str) -> LlmcStop []
+    todo("llm-client-nv.llmcreply.stop_of_anthropic")
+
+// One tool the model asked for.
+pub struct LlmcToolCall
+    // The provider's id for this call.  OPAQUE — it travels back
+    // unchanged on the result, and the two dialects generate different
+    // shapes.  A caller that built one itself has built a result the
+    // model cannot match to anything.
+    id: Str
+    name: Str
+    // The arguments AS THE PROVIDER SENT THEM, unparsed.
+    //
+    // A `Str` and not a `JsonValueH`, for a reason the streaming half
+    // makes unavoidable: arguments arrive as a JSON string split
+    // across SSE frames at byte boundaries nobody chose, so there is a
+    // point in every stream at which this text is `{"city": "Cope`.
+    // Keeping it as text means the buffered path and the streamed path
+    // produce the SAME value, and `arguments_json` is one call at the
+    // end of either.
+    //
+    // It is also the honest shape for a reply that hit the token cap
+    // mid-arguments: the text is there, the parse fails, and
+    // `LlmcStopMaxTokens` says which of the two happened.
+    arguments: Str
+
+// The arguments as a JSON value.
+//
+// `LlmcMalformedReply` when the text is not JSON — which, when
+// `stop` is `LlmcStopMaxTokens`, means the arguments were truncated
+// and the caller's `max_tokens` is what to change.
+//
+// ```novo
+// use llmcreply
+//
+// fn parsed(c: LlmcToolCall) -> Bool
+//     match llmcreply.arguments_json(c)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn arguments_json(c: LlmcToolCall) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcreply.arguments_json")
+
+// What the request and the reply cost.
+//
+// The provider's own count, which is the only exact one: a hosted
+// model's tokenizer is not published, so `llmcreq.request_tokens` is
+// an estimate and this is the bill.
+pub struct LlmcUsage
+    input_tokens: Int
+    output_tokens: Int
+    // Input tokens served from a prompt cache, which are billed at a
+    // fraction and are already INCLUDED in `input_tokens`.  A separate
+    // field rather than a subtraction because both dialects report the
+    // two differently and a caller computing a cost needs both numbers
+    // rather than one of them twice.
+    cached_input_tokens: Int
+    // Tokens spent on reasoning that is not in `text`.  Billed as
+    // output, included in `output_tokens`, and invisible in the
+    // reply — which is exactly why it is a field.
+    reasoning_tokens: Int
+
+// Every field zero, for a provider that reported no usage.
+//
+// Zero is indistinguishable from "not reported" and that is
+// deliberate: a caller that must tell them apart is a caller
+// metering, and a meter over a provider that reports nothing is broken
+// whichever sentinel this chose.
+//
+// ```novo
+// use llmcreply
+//
+// fn main() [io]
+//     println("${llmcreply.no_usage().input_tokens}")
+//     // : 0
+// ```
+pub fn no_usage() -> LlmcUsage []
+    todo("llm-client-nv.llmcreply.no_usage")
+
+// Input plus output.
+//
+// ```novo
+// use llmcreply
+//
+// fn main() [io]
+//     println("${llmcreply.total_tokens(llmcreply.no_usage())}")
+//     // : 0
+// ```
+pub fn total_tokens(u: LlmcUsage) -> Int []
+    todo("llm-client-nv.llmcreply.total_tokens")
+
+// Two usages added, for a loop that ran many turns.
+//
+// ```novo
+// use llmcreply
+//
+// fn main() [io]
+//     let u = llmcreply.add_usage(llmcreply.no_usage(), llmcreply.no_usage())
+//     println("${llmcreply.total_tokens(u)}")
+//     // : 0
+// ```
+pub fn add_usage(a: LlmcUsage, b: LlmcUsage) -> LlmcUsage []
+    todo("llm-client-nv.llmcreply.add_usage")
+
+// One reply, from either dialect.
+pub struct LlmcReply
+    // Why it ended.  READ THIS BEFORE `text`.
+    stop: LlmcStop
+    // What the model said.  Empty when the turn was a tool call, and a
+    // PREFIX when `stop` is `LlmcStopMaxTokens`.
+    text: Str
+    // The tools the model asked for, in the order it asked.
+    tool_calls: [LlmcToolCall]
+    usage: LlmcUsage
+    // The model that ACTUALLY answered, which is not always the one
+    // that was requested: an alias resolves to a dated snapshot, and a
+    // gateway may route elsewhere.  A caller comparing runs needs this
+    // one and not the one it sent.
+    model: Str
+    // The provider's id for the response, for a support request.
+    id: Str
+
+// The call ids the next request must carry a result for.
+//
+// **THE PACKAGE'S LOAD-BEARING CALL.**  A tool-use turn is not a reply
+// a caller may simply read: it puts the conversation in a state with
+// an obligation in it, and the two dialects punish an unmet obligation
+// differently — Anthropic refuses the next request with a 400 naming
+// the id, and the OpenAI dialect accepts it and lets the model answer
+// as though the tool had returned nothing.
+//
+// Publishing the list is what lets a loop assert the obligation:
+//
+// ```novo ignore
+// use llmcreply
+// use promptmsg
+//
+// fn answer(r: LlmcReply, c: PromptConvo) -> PromptConvo
+//     var out = promptmsg.push(c, llmcreply.to_message(r))
+//     for id in llmcreply.owed_tool_results(r)
+//         out = promptmsg.push(out, promptmsg.tool_result("now", id, run(id)))
+//     out
+// ```
+//
+// Empty for every reply whose `stop` is not `LlmcStopToolUse`.
+//
+// ```novo
+// use llmcreply
+//
+// fn owed(r: LlmcReply) -> Int
+//     list.len(llmcreply.owed_tool_results(r))
+// ```
+pub fn owed_tool_results(r: LlmcReply) -> [Str] []
+    todo("llm-client-nv.llmcreply.owed_tool_results")
+
+// Which of this reply's obligations a conversation does NOT discharge.
+//
+// The assertion form of `owed_tool_results`, for the caller that has
+// already built the next conversation: empty means it is safe to send.
+// `llmcreq.check` calls this, so a request that would be refused by
+// the provider is refused here first, with the id named.
+//
+// ```novo
+// use llmcreply
+// use promptmsg
+//
+// fn ready(r: LlmcReply, c: PromptConvo) -> Bool
+//     list.len(llmcreply.unanswered(r, c)) == 0
+// ```
+pub fn unanswered(r: LlmcReply, c: PromptConvo) -> [Str] []
+    todo("llm-client-nv.llmcreply.unanswered")
+
+// The assistant turn to append to the conversation.
+//
+// prompt-nv's `PromptMessage` carries text, a role, a tool name and a
+// call id — one call per message — so a turn with THREE tool calls
+// becomes three messages plus the text, and this answers the first of
+// them.  `to_messages` is the whole turn, and a caller appending only
+// this one has dropped two obligations it will be refused for.
+//
+// ```novo
+// use llmcreply
+// use promptmsg
+//
+// fn turn(r: LlmcReply) -> Str
+//     promptmsg.role_name(llmcreply.to_message(r).role)
+// ```
+pub fn to_message(r: LlmcReply) -> PromptMessage []
+    todo("llm-client-nv.llmcreply.to_message")
+
+// The whole assistant turn as prompt-nv messages.
+//
+// What to append before answering the tool calls.  The message list is
+// the lossy direction and this names the loss: prompt-nv's message is
+// text plus a role, so the tool-call ARGUMENTS do not survive a round
+// trip through it — which is fine for the next request, because the
+// provider has its own copy of the turn, and is not fine for a
+// transcript a program replays. `llmcopenai.assistant_turn` and
+// `llmcanthro.assistant_turn` are the lossless forms, and both are
+// published for exactly that reason.
+//
+// ```novo
+// use llmcreply
+//
+// fn turns(r: LlmcReply) -> Int
+//     list.len(llmcreply.to_messages(r))
+// ```
+pub fn to_messages(r: LlmcReply) -> [PromptMessage] []
+    todo("llm-client-nv.llmcreply.to_messages")
+
+// Whether the reply is a prefix of an answer rather than an answer.
+//
+// `stop == LlmcStopMaxTokens`.  A named call because it is the check
+// an application forgets, and a one-word name is what makes it get
+// written.
+//
+// ```novo
+// use llmcreply
+//
+// fn safe_to_store(r: LlmcReply) -> Bool
+//     llmcreply.is_truncated(r) == false
+// ```
+pub fn is_truncated(r: LlmcReply) -> Bool []
+    todo("llm-client-nv.llmcreply.is_truncated")
+
+// Whether the model asked for tools this turn.
+//
+// ```novo
+// use llmcreply
+//
+// fn acting(r: LlmcReply) -> Bool
+//     llmcreply.wants_tools(r)
+// ```
+pub fn wants_tools(r: LlmcReply) -> Bool []
+    todo("llm-client-nv.llmcreply.wants_tools")
+
+// The one tool call with this id, or None.
+//
+// ```novo
+// use llmcreply
+//
+// fn named(r: LlmcReply, id: Str) -> Bool
+//     match llmcreply.call_by_id(r, id)
+//         Some(_) => true
+//         None    => false
+// ```
+pub fn call_by_id(r: LlmcReply, id: Str) -> ?LlmcToolCall []
+    todo("llm-client-nv.llmcreply.call_by_id")
+
+// The reply's text parsed as JSON.
+//
+// For a request that asked for `LlmcFormatJson` or
+// `LlmcFormatSchema`.  `LlmcMalformedReply` when it is not JSON, which
+// on a truncated reply it will not be — so check `is_truncated` first
+// and the failure has a cause rather than a mystery.
+//
+// ```novo
+// use llmcreply
+//
+// fn shaped(r: LlmcReply) -> Bool
+//     match llmcreply.json_of(r)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn json_of(r: LlmcReply) -> Result<JsonValueH, LlmcFault> []
+    todo("llm-client-nv.llmcreply.json_of")
+
+// An empty reply, for a test fixture or an accumulator's zero.
+//
+// ```novo
+// use llmcreply
+//
+// fn main() [io]
+//     println("${llmcreply.empty_reply().text}")
+//     // :
+// ```
+pub fn empty_reply() -> LlmcReply []
+    todo("llm-client-nv.llmcreply.empty_reply")

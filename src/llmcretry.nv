@@ -1,0 +1,356 @@
+// llmcretry.nv — how long to wait before trying again, and what the
+// response said about it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// ONE ROW IN THIS MODULE PERFORMS ANYTHING: `now_ms` is `[time]` and
+// everything else is `[]`.  The policy, the header reading and the
+// delay arithmetic are functions of values a caller already holds, so
+// a test asserts a whole backoff schedule with no clock in it.
+//
+// THE JITTER TAKES A UNIFORM AS AN ARGUMENT.  `next_delay_ms` has a
+// `u: Float` in [0, 1) parameter and draws nothing.  That is the rule
+// hnsw-nv, fake-nv and stats-nv already follow, and it buys the same
+// thing here: a retry schedule is a pure function of the policy, the
+// attempt and the uniform sequence, so the same inputs produce the
+// same waits on any machine and a test asserts the numbers rather than
+// a range.  rand-nv is `host` and this package is too, so the
+// constraint is not a layer rule here — it is a reproducibility one,
+// and it is worth more.
+//
+// WHAT A RETRY LOOP OVER AN LLM API HAS TO KNOW, and none of it is
+// derivable from the status alone:
+//
+//   THE SERVER USUALLY SAYS HOW LONG.  `Retry-After` — in seconds, or
+//   as an HTTP date — and the provider-specific reset headers.  A
+//   client using its own exponential backoff instead either waits four
+//   seconds when it was told six, and gets a second 429, or waits
+//   sixty when it was told two.  `limits_of` reads them and
+//   `next_delay_ms` prefers what the server said.
+//
+//   A 429 IS TWO DIFFERENT LIMITS.  Requests per minute and TOKENS per
+//   minute reset at different times, and a large request can exhaust
+//   the token bucket while the request bucket is untouched.  Both
+//   remaining counts and both resets are fields, because a client that
+//   only watched request rate throttles at the wrong moment.
+//
+//   A POST THAT TIMED OUT MAY HAVE BEEN EXECUTED.  The completion was
+//   generated and billed and the reply was lost coming back; the
+//   retry generates and bills a second one.  That is what
+//   `idempotency_key` is for, and it is a FIELD on the policy rather
+//   than a convenience, so a loop that retries without one had to
+//   leave it empty on purpose.
+//
+//   THE DURATION FORMATS DISAGREE.  `Retry-After: 6` is seconds,
+//   `x-ratelimit-reset-requests: 6m0s` is Go's duration spelling, and
+//   `1.5s`, `840ms` and a bare `0` all occur.  `parse_duration_ms`
+//   handles all of them and answers -1 for what it cannot read, which
+//   is not zero — zero would retry immediately into the same limit.
+
+use std.list
+use llmcfault
+
+// How a caller retries.
+pub struct LlmcRetry
+    // Total attempts including the first.  1 means do not retry.
+    max_attempts: Int
+    // The first backoff, doubled per attempt.
+    base_delay_ms: Int
+    // The ceiling the doubling stops at.
+    max_delay_ms: Int
+    // Whether `Retry-After` and the reset headers override the
+    // computed delay.  True by default, and a caller turning it off
+    // should have a reason it can write down.
+    respect_server_delay: Bool
+    // The key sent as `Idempotency-Key`, or empty.  Empty means a
+    // retried POST may produce and bill a second completion; see the
+    // module header.
+    idempotency_key: Str
+
+// Three attempts, 500 ms base, 30 s ceiling, honouring the server.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.retry().max_attempts}")
+//     // : 3
+// ```
+pub fn retry() -> LlmcRetry []
+    todo("llm-client-nv.llmcretry.retry")
+
+// No retry at all: one attempt.
+//
+// Published because "do not retry" is a decision a caller should be
+// able to state rather than achieve by setting a number to one.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.no_retry().max_attempts}")
+//     // : 1
+// ```
+pub fn no_retry() -> LlmcRetry []
+    todo("llm-client-nv.llmcretry.no_retry")
+
+// The same policy with another attempt count.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.with_max_attempts(llmcretry.retry(), 5).max_attempts}")
+//     // : 5
+// ```
+pub fn with_max_attempts(p: LlmcRetry, n: Int) -> LlmcRetry []
+    todo("llm-client-nv.llmcretry.with_max_attempts")
+
+// The same policy with another base delay.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.with_base_delay_ms(llmcretry.retry(), 250).base_delay_ms}")
+//     // : 250
+// ```
+pub fn with_base_delay_ms(p: LlmcRetry, ms: Int) -> LlmcRetry []
+    todo("llm-client-nv.llmcretry.with_base_delay_ms")
+
+// The same policy with another ceiling.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.with_max_delay_ms(llmcretry.retry(), 60000).max_delay_ms}")
+//     // : 60000
+// ```
+pub fn with_max_delay_ms(p: LlmcRetry, ms: Int) -> LlmcRetry []
+    todo("llm-client-nv.llmcretry.with_max_delay_ms")
+
+// The same policy with an idempotency key.
+//
+// The key a caller generates once per LOGICAL request and reuses for
+// every retry of it — which is the point: a new key per attempt is no
+// key at all.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println(llmcretry.with_idempotency_key(llmcretry.retry(), "req-1").idempotency_key)
+//     // : req-1
+// ```
+pub fn with_idempotency_key(p: LlmcRetry, key: Str) -> LlmcRetry []
+    todo("llm-client-nv.llmcretry.with_idempotency_key")
+
+// What the response's headers said about the limits.
+//
+// Every field -1 when the header was absent, which is not zero: zero
+// remaining means throttle NOW and absent means the provider did not
+// say.
+pub struct LlmcRateLimit
+    requests_remaining: Int
+    tokens_remaining: Int
+    requests_reset_ms: Int
+    tokens_reset_ms: Int
+    // `Retry-After`, in milliseconds.  The one a 429 or a 503 carries,
+    // and the one that beats the computed backoff.
+    retry_after_ms: Int
+
+// Every field -1: a response that said nothing about limits.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.no_limits().retry_after_ms}")
+//     // : -1
+// ```
+pub fn no_limits() -> LlmcRateLimit []
+    todo("llm-client-nv.llmcretry.no_limits")
+
+// Read the limits out of a response's header lines.
+//
+// Handles both providers' spellings —
+// `x-ratelimit-remaining-requests` / `x-ratelimit-reset-tokens` and
+// `anthropic-ratelimit-requests-remaining` /
+// `anthropic-ratelimit-tokens-reset` — plus `Retry-After`, which both
+// send and which is the only one some gateways forward.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     let l = llmcretry.limits_of(["Retry-After: 6"])
+//     println("${l.retry_after_ms}")
+//     // : 6000
+// ```
+pub fn limits_of(headers: [Str]) -> LlmcRateLimit []
+    todo("llm-client-nv.llmcretry.limits_of")
+
+// A duration header's value in milliseconds, or -1.
+//
+// Reads a bare number of seconds (`6`), Go's duration spelling
+// (`6m0s`, `1.5s`, `840ms`) and an HTTP date, which `Retry-After` also
+// permits and which needs `now_ms` to turn into a delay — so a date
+// answers -1 here and `retry_after_from` is the call that takes the
+// clock.
+//
+// -1 for what it cannot read, never 0: a zero delay retries
+// immediately into the limit that just refused.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.parse_duration_ms("1.5s")}")
+//     // : 1500
+// ```
+pub fn parse_duration_ms(text: Str) -> Int []
+    todo("llm-client-nv.llmcretry.parse_duration_ms")
+
+// `Retry-After` as a delay, resolving the HTTP-date form against a
+// clock reading the caller supplies.
+//
+// The clock is an argument so the function stays `[]` and a test can
+// assert the date arithmetic without waiting for a date.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.retry_after_from("6", 0)}")
+//     // : 6000
+// ```
+pub fn retry_after_from(header_value: Str, now_ms: Int) -> Int []
+    todo("llm-client-nv.llmcretry.retry_after_from")
+
+// Whether this fault, at this attempt, is worth another try.
+//
+// `llmcfault.is_retryable` and the attempt count, in one call, so a
+// loop does not write the conjunction itself.
+//
+// ```novo
+// use llmcretry
+// use llmcfault
+//
+// fn main() [io]
+//     println("${llmcretry.should_retry(llmcretry.retry(), 1, LlmcOverloaded("busy"))}")
+//     // : true
+// ```
+pub fn should_retry(p: LlmcRetry, attempt: Int, f: LlmcFault) -> Bool []
+    todo("llm-client-nv.llmcretry.should_retry")
+
+// How long to wait before attempt `attempt + 1`, or None to stop.
+//
+// The order of preference, which is the whole of the function:
+//
+//   1. `limit.retry_after_ms`, when the policy respects it and the
+//      server sent one.  The server knows its own bucket.
+//   2. The relevant reset, when the fault is a rate limit and the
+//      response carried one.
+//   3. `base_delay_ms * 2^(attempt - 1)`, capped at `max_delay_ms`,
+//      with full jitter drawn from `u`.
+//
+// None when the attempt budget is spent or the fault is not
+// retryable — so a loop's condition is `match next_delay_ms(...)` and
+// there is no second check to forget.
+//
+// `u` is a uniform in [0, 1) the caller draws; see the module header
+// for why it is a parameter.
+//
+// ```novo
+// use llmcretry
+// use llmcfault
+//
+// fn main() [io]
+//     match llmcretry.next_delay_ms(llmcretry.retry(), 1,
+//                                   LlmcAuthFailed(401, "bad key"),
+//                                   llmcretry.no_limits(), 0.5)
+//         Some(_) => println("waiting")
+//         None    => println("a 401 is never worth retrying")
+//     // : a 401 is never worth retrying
+// ```
+pub fn next_delay_ms(p: LlmcRetry, attempt: Int, f: LlmcFault, limit: LlmcRateLimit,
+                     u: Float) -> ?Int []
+    todo("llm-client-nv.llmcretry.next_delay_ms")
+
+// The whole schedule a policy would produce, given a uniform per
+// attempt.
+//
+// For a test, and for the caller that wants to show a person what the
+// client is going to do before it does it.
+//
+// ```novo
+// use llmcretry
+// use llmcfault
+//
+// fn plan(us: [Float]) -> Int
+//     list.len(llmcretry.schedule(llmcretry.retry(), LlmcOverloaded("busy"),
+//                                 llmcretry.no_limits(), us))
+// ```
+pub fn schedule(p: LlmcRetry, f: LlmcFault, limit: LlmcRateLimit, us: [Float]) -> [Int] []
+    todo("llm-client-nv.llmcretry.schedule")
+
+// The headers a retried request carries, or an empty list.
+//
+// `Idempotency-Key: …` when the policy has one.  A list rather than a
+// `?Str` so a caller concatenates header lists and never formats a
+// header name.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${list.len(llmcretry.idempotency_headers(llmcretry.retry()))}")
+//     // : 0
+// ```
+pub fn idempotency_headers(p: LlmcRetry) -> [Str] []
+    todo("llm-client-nv.llmcretry.idempotency_headers")
+
+// The monotonic clock, in milliseconds.
+//
+// **THE ONLY ROW IN THIS MODULE THAT PERFORMS ANYTHING**, and one of
+// three in the package.  Everything else takes a reading as an
+// argument, which is what lets a backoff schedule be asserted exactly.
+//
+// ```novo ignore
+// use llmcretry
+//
+// fn started() -> Int [time]
+//     llmcretry.now_ms()
+// ```
+pub fn now_ms() -> Int [time]
+    todo("llm-client-nv.llmcretry.now_ms")
+
+// How long a request has taken, from two readings.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.elapsed_ms(1000, 1750)}")
+//     // : 750
+// ```
+pub fn elapsed_ms(started_ms: Int, now_ms: Int) -> Int []
+    todo("llm-client-nv.llmcretry.elapsed_ms")
+
+// Whether a deadline has passed.
+//
+// Published because the check a retry loop actually needs is "is
+// there time for another attempt", not "how long have I waited", and
+// a loop that computed the second and compared it by hand gets the
+// sign wrong once per project.
+//
+// ```novo
+// use llmcretry
+//
+// fn main() [io]
+//     println("${llmcretry.deadline_passed(1000, 30000, 40000)}")
+//     // : true
+// ```
+pub fn deadline_passed(started_ms: Int, budget_ms: Int, now_ms: Int) -> Bool []
+    todo("llm-client-nv.llmcretry.deadline_passed")

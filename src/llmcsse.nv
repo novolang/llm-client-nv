@@ -1,0 +1,304 @@
+// llmcsse.nv — the streamed reply: server-sent event frames, and the
+// accumulator that turns them back into one reply.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout, feed-and-drain, with the loop in the host.  The
+// caller reads bytes off its own transport and hands them here; this
+// answers frames, the dialect turns a frame into events, and
+// `apply` folds an event into the partial reply.  Nothing here reads
+// a socket, so a whole streamed exchange is a byte array in a test.
+//
+// WHY A STREAM IS NOT A CALLBACK.  `std.llm.stream` takes one, and its
+// own page records what that costs: on the compiled leg the whole
+// reply is delivered in a single call, so a program written against
+// the callback is a program whose "streaming" silently is not.  A
+// callback also decides for the caller where the loop lives, which is
+// the one decision a library should not make — a terminal repainting
+// per delta, an HTTP server forwarding to its own client and an agent
+// counting tokens all want different loops.
+//
+// THE THREE THINGS A WRONG SSE READER GETS WRONG QUIETLY:
+//
+//   A FRAME ENDS AT A BLANK LINE, NOT AT A NEWLINE.  A `data:` line is
+//   one line of a frame and a frame may have several; a reader that
+//   emitted per line splits one JSON document into pieces and reports
+//   the first as malformed.
+//
+//   `data: [DONE]` IS NOT JSON.  It is the OpenAI dialect's terminator
+//   and a reader that parsed every frame reports a malformed reply at
+//   the end of every SUCCESSFUL stream.  `is_done` is the check.
+//
+//   TOOL-CALL ARGUMENTS ARRIVE SPLIT AT ARBITRARY BYTE BOUNDARIES.
+//   There is a point in every tool-calling stream at which the
+//   accumulated arguments are `{"city": "Cope`.  A reader that parsed
+//   each delta reports malformed JSON for most of the stream; the
+//   arguments accumulate as TEXT and are parsed once, which is also
+//   why `LlmcToolCall.arguments` is a `Str`.
+//
+// AND THE ONE THAT IS NOT QUIET, WHICH IS WHY `finish` ANSWERS A
+// RESULT: A STREAM THAT ENDS WITH NO TERMINAL EVENT IS A TRUNCATED
+// REPLY.  The connection dropped, the deadline fired, the proxy cut
+// it — and the text accumulated so far reads exactly like an answer.
+// `finish` refuses with `LlmcStreamTruncated`, carrying how much
+// arrived; `partial` is the accessor for a caller that wants to show
+// it anyway, named so that showing it is a decision.
+
+use std.bytes
+
+// One server-sent event, assembled from its lines.
+pub struct LlmcSseFrame
+    // The `event:` field, or empty.  The Anthropic dialect names every
+    // frame (`content_block_delta`, `message_stop`); the OpenAI one
+    // names none and puts the discriminator inside the data.
+    event: Str
+    // The `data:` field, with multiple `data:` lines joined by a
+    // newline, as the specification requires.
+    data: Str
+    // The `id:` field, or empty.
+    id: Str
+    // The `retry:` field in milliseconds, or -1 when absent.
+    retry_ms: Int
+
+// The reader between "some bytes turned up" and "here is a frame".
+//
+// Opaque: the fields are here because a struct needs them, and a
+// caller that reaches into one has coupled itself to a buffering
+// decision this module intends to change.
+pub struct LlmcSseReader
+    pending: [u8]
+    offset: Int
+    max_frame: Int
+
+// A reader and the one frame that came out of it, if one did.
+pub struct LlmcSseStep
+    reader: LlmcSseReader
+    frame: ?LlmcSseFrame
+
+// A reader with the default frame limit.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     println("${llmcsse.reader().max_frame}")
+// ```
+pub fn reader() -> LlmcSseReader []
+    todo("llm-client-nv.llmcsse.reader")
+
+// A reader that refuses a frame larger than `max_frame` bytes.
+//
+// A limit rather than a growing buffer, because the peer decides how
+// much it sends: a stream that never blanks a line is a stream that
+// buffers until the process dies, and a program talking to a gateway
+// it does not own should be able to say how much it will hold.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     println("${llmcsse.reader_with(65536).max_frame}")
+//     // : 65536
+// ```
+pub fn reader_with(max_frame: Int) -> LlmcSseReader []
+    todo("llm-client-nv.llmcsse.reader_with")
+
+// Feed bytes, and take the first frame they completed.
+//
+// The frame is `None` when the bytes did not finish one.  Call `take`
+// until it answers `None` to drain the rest: one chunk off a socket
+// routinely completes several.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     match llmcsse.feed(llmcsse.reader(), [])
+//         Ok(_)  => println("fed")
+//         Err(_) => println("refused")
+// ```
+pub fn feed(r: LlmcSseReader, data: [u8]) -> Result<LlmcSseStep, LlmcFault> []
+    todo("llm-client-nv.llmcsse.feed")
+
+// Take the next frame out of what has already been fed.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     match llmcsse.take(llmcsse.reader())
+//         Ok(_)  => println("taken")
+//         Err(_) => println("refused")
+// ```
+pub fn take(r: LlmcSseReader) -> Result<LlmcSseStep, LlmcFault> []
+    todo("llm-client-nv.llmcsse.take")
+
+// How many fed bytes have not yet made a frame.
+//
+// Published so a test asserts directly that a reader holds nothing
+// whose size the peer chose, rather than trusting a paragraph.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     println("${llmcsse.pending_len(llmcsse.reader())}")
+//     // : 0
+// ```
+pub fn pending_len(r: LlmcSseReader) -> Int []
+    todo("llm-client-nv.llmcsse.pending_len")
+
+// Whether this frame is the OpenAI dialect's `[DONE]` terminator.
+//
+// Which is not JSON, and is the reason a reader that parsed every
+// frame reports a malformed reply at the end of every successful
+// stream.
+//
+// ```novo
+// use llmcsse
+//
+// fn done(f: LlmcSseFrame) -> Bool
+//     llmcsse.is_done(f)
+// ```
+pub fn is_done(f: LlmcSseFrame) -> Bool []
+    todo("llm-client-nv.llmcsse.is_done")
+
+// What one frame of a stream said, after its dialect decoded it.
+//
+// One vocabulary for both dialects.  The Anthropic dialect emits these
+// almost one to one from its named events; the OpenAI dialect derives
+// them from the deltas in each chunk.
+pub enum LlmcEvent
+    // The reply has an id and a model.  First, once.
+    LlmcEventStart(id: Str, model: Str)
+    // More text.  A DELTA, not the text so far.
+    LlmcEventText(delta: Str)
+    // A tool call begins.  `index` is its position in the turn, which
+    // is what the argument deltas are keyed by — the id and the name
+    // arrive once, and everything after them arrives by index.
+    LlmcEventToolStart(index: Int, id: Str, name: Str)
+    // More argument text for the tool call at `index`.  Accumulates as
+    // TEXT; nothing parses until the stream is finished.
+    LlmcEventToolArgs(index: Int, delta: Str)
+    // The usage, which arrives at the END of a stream — and on the
+    // OpenAI dialect only when the request asked for it.
+    LlmcEventUsage(usage: LlmcUsage)
+    // The reply ended, and why.  The terminal event `finish` requires.
+    LlmcEventStop(stop: LlmcStop)
+    // A keep-alive.  Carries nothing, and a reader that treated it as
+    // content appends an empty string forever.
+    LlmcEventPing
+
+// The partial reply a stream has built so far.
+//
+// A VALUE, like everything else in this package: `apply` takes one and
+// answers one, so a caller can keep the state wherever its loop keeps
+// state and a test can assert an exact intermediate.
+pub struct LlmcStream
+    id: Str
+    model: Str
+    text: Str
+    tool_ids: [Str]
+    tool_names: [Str]
+    tool_args: [Str]
+    usage: LlmcUsage
+    stop: ?LlmcStop
+
+// An empty accumulator.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     println("${llmcsse.stream().text}")
+//     // :
+// ```
+pub fn stream() -> LlmcStream []
+    todo("llm-client-nv.llmcsse.stream")
+
+// Fold one event into the accumulator.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     let s = llmcsse.apply(llmcsse.stream(), LlmcEventText("hel"))
+//     println(llmcsse.apply(s, LlmcEventText("lo")).text)
+//     // : hello
+// ```
+pub fn apply(s: LlmcStream, e: LlmcEvent) -> LlmcStream []
+    todo("llm-client-nv.llmcsse.apply")
+
+// Fold a whole frame's events at once.
+//
+// ```novo
+// use llmcsse
+//
+// fn fold(s: LlmcStream, es: [LlmcEvent]) -> LlmcStream
+//     llmcsse.apply_all(s, es)
+// ```
+pub fn apply_all(s: LlmcStream, es: [LlmcEvent]) -> LlmcStream []
+    todo("llm-client-nv.llmcsse.apply_all")
+
+// Whether a terminal event has arrived.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     println("${llmcsse.finished(llmcsse.stream())}")
+//     // : false
+// ```
+pub fn finished(s: LlmcStream) -> Bool []
+    todo("llm-client-nv.llmcsse.finished")
+
+// The reply as it stands, whether or not the stream finished.
+//
+// For a caller painting deltas as they arrive, and for the one that
+// wants to show a truncated answer after `finish` refused it.  Named
+// so that showing an unfinished reply is a decision somebody made.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     println("${llmcsse.partial(llmcsse.stream()).text}")
+//     // :
+// ```
+pub fn partial(s: LlmcStream) -> LlmcReply []
+    todo("llm-client-nv.llmcsse.partial")
+
+// The finished reply, or a refusal.
+//
+// `LlmcStreamTruncated` when no terminal event arrived, carrying how
+// many characters did — because a stream that dropped has text in it
+// that reads exactly like an answer, and a `?LlmcReply` would have
+// made "the connection died" and "the model said nothing" the same
+// value.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     match llmcsse.finish(llmcsse.stream())
+//         Ok(_)  => println("finished")
+//         Err(_) => println("truncated")
+//     // : truncated
+// ```
+pub fn finish(s: LlmcStream) -> Result<LlmcReply, LlmcFault> []
+    todo("llm-client-nv.llmcsse.finish")
+
+// The text delta an event carries, or empty.
+//
+// The one-line convenience a terminal repainting per frame wants, so
+// the common loop is not a `match` over seven variants.
+//
+// ```novo
+// use llmcsse
+//
+// fn main() [io]
+//     println(llmcsse.text_delta(LlmcEventText("hi")))
+//     // : hi
+// ```
+pub fn text_delta(e: LlmcEvent) -> Str []
+    todo("llm-client-nv.llmcsse.text_delta")

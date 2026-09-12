@@ -1,0 +1,187 @@
+// llmcwire_tests.nv — the two dialects' differences, each of which is
+// a 400 or a wrong answer for a client that assumed the other.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// llm-client-nv.<module>.<fn>`.
+
+use std.test
+use std.json
+use llmcfault
+use llmcreq
+use llmcopenai
+use llmcanthro
+use promptmsg
+
+fn convo_with_system() -> PromptConvo
+    promptmsg.with_system(promptmsg.convo([promptmsg.user("hello")]),
+                          "you are concise")
+
+@test
+fn test_the_system_prompt_is_a_message_in_one_dialect_and_a_field_in_the_other() [io]
+    // A system message left in the Anthropic array is a 400 naming the
+    // role, and it is the first thing a client ported across hits.
+    let c = convo_with_system()
+
+    test.case("the OpenAI dialect keeps it in the array")
+    match llmcopenai.encode_messages(c)
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert(json.type_of(v) == "array")
+
+    test.case("the Anthropic dialect lifts it into its own field")
+    test.assert(llmcanthro.encode_system(c) == "you are concise")
+
+    test.case("and its array carries the body only")
+    match llmcanthro.encode_messages(c)
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert(json.len(v) == Some(1))
+
+@test
+fn test_anthropic_requires_max_tokens_and_the_check_refuses_without_it() [io]
+    // No default exists.  Caught before the bytes leave, rather than
+    // as a 400 with a sentence in it.
+    let r = llmcreq.request("claude-haiku-4-5", convo_with_system())
+
+    test.case("refused for the Anthropic dialect")
+    match llmcreq.check(r, LlmcAnthropicMessages)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("accepted for the OpenAI one, which has a default")
+    match llmcreq.check(r, LlmcOpenAiChat)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_seed_has_no_anthropic_spelling_and_is_named_rather_than_dropped() [io]
+    // A client that quietly dropped it leaves a caller believing the
+    // run is reproducible.
+    let p = llmcreq.with_seed(llmcreq.with_max_tokens(llmcreq.params(), 256), 7)
+    let r = llmcreq.with_params(llmcreq.request("claude-haiku-4-5",
+                                                convo_with_system()),
+                                                p)
+
+    match llmcreq.check(r, LlmcAnthropicMessages)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.case("and the refusal is the caller's own error")
+            test.assert(llmcfault.is_caller_error(f))
+
+@test
+fn test_two_tools_with_one_name_are_refused() [io]
+    // The model picks by name, so the second definition is unreachable
+    // and the first answers for it.
+    let a = llmcreq.tool("get_weather", "one", json.object([]))
+    let b = llmcreq.tool("get_weather", "another", json.object([]))
+    let r = llmcreq.with_tools(llmcreq.request("gpt-4o-mini", convo_with_system()),
+                               [a, b])
+
+    match llmcreq.check(r, LlmcOpenAiChat)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_forcing_a_tool_with_no_tools_is_refused() [io]
+    let r = llmcreq.with_tool_choice(llmcreq.request("gpt-4o-mini",
+                                                     convo_with_system()),
+                                     LlmcToolRequired)
+
+    match llmcreq.check(r, LlmcOpenAiChat)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_provider_qualified_model_name_is_not_a_model_name() [io]
+    // `std.llm` takes `openai:gpt-4o-mini`; this package takes the bare
+    // name.  Sending the qualified one produces a 404 that reads
+    // exactly like a rejected key.
+    test.case("qualified is refused")
+    test.assert(llmcopenai.is_model_name("openai:gpt-4o-mini") == false)
+
+    test.case("bare is accepted")
+    test.assert(llmcopenai.is_model_name("gpt-4o-mini"))
+
+    test.case("and the other dialect makes the same refusal")
+    test.assert(llmcanthro.is_model_name("anthropic:claude-haiku-4-5") == false)
+
+@test
+fn test_a_tool_choice_is_required_in_one_dialect_and_any_in_the_other() [io]
+    // The spelling difference a client ported across gets a 400 for.
+    test.case("the OpenAI dialect spells it as a bare string")
+    test.assert(json.type_of(llmcopenai.encode_tool_choice(LlmcToolRequired)) == "string")
+
+    test.case("the Anthropic dialect spells it as an object")
+    test.assert(json.type_of(llmcanthro.encode_tool_choice(LlmcToolRequired)) == "object")
+
+@test
+fn test_json_with_no_schema_has_no_anthropic_spelling() [io]
+    // That API has no `response_format`.  A client that dropped the
+    // request returns prose to a caller that will parse it.
+    test.case("the OpenAI dialect encodes it")
+    match llmcopenai.encode_format(LlmcFormatJson)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("the Anthropic dialect names the gap instead")
+    match llmcanthro.encode_format(LlmcFormatJson)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_tool_result_is_keyed_by_call_id_and_never_by_tool_name() [io]
+    // Two calls to one tool in one turn differ only by id.
+    let m = llmcopenai.tool_result_message("call_b", "13 degrees")
+
+    test.case("the id is what the message carries")
+    test.assert(json.get_str(m, "tool_call_id") == Some("call_b"))
+
+    test.case("and the role is the dialect's own")
+    test.assert(json.get_str(m, "role") == Some("tool"))
+
+@test
+fn test_a_tool_result_in_the_other_dialect_is_a_user_message() [io]
+    // There is no `tool` role here.  A client that invented one gets a
+    // 400; one that sent the result as plain user text gets an answer,
+    // and the answer is the model guessing.
+    let m = llmcanthro.tool_result_message("toolu_1", "13 degrees", false)
+
+    test.assert(json.get_str(m, "role") == Some("user"))
+
+@test
+fn test_a_failed_tool_is_a_result_the_model_sees() [io]
+    // A loop that hid the failure gets the same call again; one that
+    // raised gets a program that cannot recover from a transient tool.
+    let m = llmcanthro.tool_result_message("toolu_1", "the service is down", true)
+
+    test.assert(json.type_of(m) == "object")
+
+@test
+fn test_five_twenty_nine_is_overloaded_and_not_a_server_error() [io]
+    // The one status whose right answer is a LONGER wait.
+    let f = llmcanthro.decode_error(529,
+        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}")
+
+    test.case("retryable")
+    test.assert(llmcfault.is_retryable(f))
+
+    test.case("and not the caller's own error")
+    test.assert(llmcfault.is_caller_error(f) == false)
+
+@test
+fn test_a_context_length_error_carries_the_provider_code() [io]
+    // The sentence beside it is prose that changes without notice; the
+    // code is what a program branches on.
+    let body = "{\"error\":{\"message\":\"maximum context length\",\"type\":\"invalid_request_error\",\"code\":\"context_length_exceeded\"}}"
+
+    match llmcopenai.decode_error(400, body)
+        LlmcBadRequest(status, code, _) =>
+            test.case("the status")
+            test.assert(status == 400)
+            test.case("and the machine-readable code")
+            test.assert(code == "context_length_exceeded")
+        _                               => test.assert(false)
+
+@test
+fn test_a_401_is_never_retried_and_a_429_always_is() [io]
+    test.assert(llmcfault.is_retryable(llmcopenai.decode_error(401, "")) == false)
+    test.assert(llmcfault.is_retryable(llmcopenai.decode_error(429, "")))

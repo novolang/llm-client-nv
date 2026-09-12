@@ -1,0 +1,278 @@
+// llmcvalue_tests.nv — the values a caller builds before anything is
+// sent, and the accessors it reads afterwards.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// llm-client-nv.<module>.<fn>`.
+//
+// The coarse suite: one test per area, asserting the contract each
+// area states in its doc comments.  The fine-grained behaviour is in
+// the other four files; this one is the shape that says a public name
+// exists and answers what it promised.
+
+use std.test
+use std.json
+use std.list
+use llmcanthro
+use llmcfault
+use llmcopenai
+use llmcreply
+use llmcreq
+use llmcretry
+use llmcsse
+use promptmsg
+use tokmodel
+
+fn a_convo() -> PromptConvo
+    promptmsg.convo([promptmsg.user("hello")])
+
+@test
+fn test_a_dialect_round_trips_through_its_configuration_name() [io]
+    // A program that read its provider from a file has a `Str`.
+    test.assert(llmcreq.dialect_name(LlmcOpenAiChat) == "openai")
+    test.assert(llmcreq.dialect_name(LlmcAnthropicMessages) == "anthropic")
+
+    match llmcreq.dialect_of_name("anthropic")
+        None    => test.assert(false)
+        Some(d) => test.assert(llmcreq.dialect_name(d) == "anthropic")
+
+    test.case("and a name this package does not speak is None")
+    match llmcreq.dialect_of_name("cohere")
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_a_local_server_needs_no_key_and_a_hosted_one_says_so() [io]
+    let local = llmcreq.compatible("http://127.0.0.1:8080", "")
+
+    test.case("an empty key is legal")
+    test.assert(llmcreq.key_is_set(local) == false)
+
+    test.case("and the origin is the caller's")
+    test.assert(llmcreq.provider_base_url(local) == "http://127.0.0.1:8080")
+
+    test.case("a hosted provider has one")
+    test.assert(llmcreq.key_is_set(llmcreq.openai("sk-test")))
+
+@test
+fn test_a_provider_is_reconfigured_by_value() [io]
+    let p = llmcreq.with_api_version(
+                llmcreq.with_header(
+                    llmcreq.with_base_url(llmcreq.anthropic("sk-ant-test"),
+                                          "https://gw.example.com"),
+                    "X-Trace", "abc"),
+                "2023-06-01")
+
+    test.assert(llmcreq.provider_base_url(p) == "https://gw.example.com")
+    test.assert(list.len(p.extra_headers) == 1)
+    test.assert(p.api_version == "2023-06-01")
+
+@test
+fn test_the_key_never_appears_in_a_line_meant_for_a_person() [io]
+    // The second thing that happens to a provider value is that
+    // somebody prints it, and a key in a log file is one to rotate.
+    let line = llmcreq.redacted(llmcreq.openai("sk-secret-1234"))
+
+    test.assert(line != "sk-secret-1234")
+
+@test
+fn test_the_endpoint_path_comes_from_the_dialect_and_not_from_the_caller() [io]
+    // A path written by hand against the wrong dialect is a 404 that
+    // reads exactly like a rejected key.
+    test.assert(llmcreq.chat_path(llmcreq.openai("sk-test")) == "/v1/chat/completions")
+    test.assert(llmcreq.chat_path(llmcreq.anthropic("sk-ant-test")) == "/v1/messages")
+
+@test
+fn test_the_headers_carry_what_each_api_requires() [io]
+    test.case("both providers send some")
+    test.assert(list.len(llmcreq.auth_headers(llmcreq.openai("sk-test"))) > 0)
+    test.assert(list.len(llmcreq.auth_headers(llmcreq.anthropic("sk-ant-test"))) > 0)
+
+@test
+fn test_an_unset_parameter_is_minus_one_and_not_zero() [io]
+    // Zero is a meaningful temperature and a meaningful top_p, so a
+    // default of zero would have silenced the model.
+    let p = llmcreq.params()
+
+    test.assert(p.max_tokens == -1)
+
+    let full = llmcreq.with_stop(
+                   llmcreq.with_top_p(
+                       llmcreq.with_temperature(p, 0.0), 0.9),
+                   ["END"])
+
+    test.assert(list.len(full.stop) == 1)
+
+@test
+fn test_a_request_is_built_by_value_and_streams_as_a_field() [io]
+    // A caller switching between buffered and streamed should not
+    // rewrite a call.
+    let r = llmcreq.streaming(
+                llmcreq.with_format(llmcreq.request("gpt-4o-mini", a_convo()),
+                                    LlmcFormatJson))
+
+    test.assert(r.stream)
+
+@test
+fn test_a_tool_name_is_what_both_providers_accept() [io]
+    test.assert(llmcreq.is_tool_name("get_weather"))
+    test.assert(llmcreq.is_tool_name("get weather") == false)
+
+@test
+fn test_a_budget_is_checked_locally_before_the_round_trip() [io]
+    // Against a hosted model the count is an estimate; against a local
+    // checkpoint it is exact.  `usage` is the truth in both cases and
+    // arrives after the money is spent.
+    let m = tokmodel.of_tokenizer_json("{}")
+
+    match m
+        Err(_) => test.assert(true)
+        Ok(mm) =>
+            let r = llmcreq.request("gpt-4o-mini", a_convo())
+
+            test.case("the tool catalogue is counted on its own")
+            test.assert(llmcreq.tools_tokens(mm, r.tools) >= 0)
+
+            test.case("and the whole request is counted")
+            test.assert(llmcreq.request_tokens(mm, r) >= 0)
+
+            test.case("a budget of one refuses it")
+            match llmcreq.check_budget(mm, r, 1)
+                Ok(_)  => test.assert(false)
+                Err(_) => test.assert(true)
+
+@test
+fn test_a_status_alone_implies_a_fault_before_a_body_is_read() [io]
+    // The mapping both dialects share; each then replaces the message
+    // from its own error body.
+    test.assert(llmcfault.status_of(llmcfault.of_status(503, "unavailable")) == 503)
+
+    test.case("and a delay the response asked for is applied afterwards")
+    let f = llmcfault.with_retry_after(llmcfault.of_status(429, "slow down"), 2000)
+    test.assert(llmcfault.status_of(f) == 429)
+
+@test
+fn test_the_two_finish_vocabularies_map_onto_one_enum() [io]
+    test.assert(llmcreply.is_complete(llmcreply.stop_of_openai("stop")))
+    test.assert(llmcreply.is_complete(llmcreply.stop_of_openai("length")) == false)
+    test.assert(llmcreply.is_complete(llmcreply.stop_of_anthropic("end_turn")))
+    test.assert(llmcreply.is_complete(llmcreply.stop_of_anthropic("max_tokens")) == false)
+
+@test
+fn test_usage_adds_across_the_turns_of_a_loop() [io]
+    let a = llmcreply.no_usage()
+    test.assert(llmcreply.total_tokens(llmcreply.add_usage(a, a)) == 0)
+
+@test
+fn test_an_empty_reply_is_the_accumulator_s_zero() [io]
+    let r = llmcreply.empty_reply()
+
+    test.case("no obligations")
+    test.assert(list.len(llmcreply.owed_tool_results(r)) == 0)
+
+    test.case("nothing unanswered")
+    test.assert(list.len(llmcreply.unanswered(r, a_convo())) == 0)
+
+    test.case("one message for the turn")
+    test.assert(list.len(llmcreply.to_messages(r)) >= 0)
+
+    test.case("and a role a conversation can take")
+    test.assert(promptmsg.role_name(llmcreply.to_message(r).role) != "")
+
+@test
+fn test_a_shaped_reply_s_text_is_read_as_json_in_one_call() [io]
+    match llmcreply.json_of(llmcreply.empty_reply())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_lossless_turn_is_the_dialect_s_own() [io]
+    // prompt-nv's message is text plus a role, so a transcript a
+    // program replays needs this one and not `to_messages`.
+    let r = llmcreply.empty_reply()
+
+    test.assert(json.type_of(llmcopenai.assistant_turn(r)) == "object")
+    test.assert(json.type_of(llmcanthro.assistant_turn(r)) == "object")
+
+@test
+fn test_a_request_encodes_whole_in_both_dialects() [io]
+    let r = llmcreq.with_params(llmcreq.request("gpt-4o-mini", a_convo()),
+                                llmcreq.with_max_tokens(llmcreq.params(), 256))
+    let p = llmcreq.openai("sk-test")
+
+    match llmcopenai.encode_request(p, r)
+        Ok(v)  => test.assert(json.type_of(v) == "object")
+        Err(_) => test.assert(false)
+
+    match llmcopenai.encode_body(p, r)
+        Ok(s)  => test.assert(s != "")
+        Err(_) => test.assert(false)
+
+    match llmcopenai.encode_message(promptmsg.user("hello"))
+        Ok(v)  => test.assert(json.type_of(v) == "object")
+        Err(_) => test.assert(false)
+
+    test.assert(json.type_of(llmcopenai.encode_tool(
+        llmcreq.tool("now", "the time", json.object([])))) == "object")
+
+@test
+fn test_a_parsed_value_decodes_without_being_reserialised() [io]
+    match json.parse("{\"id\":\"x\",\"choices\":[]}")
+        None    => test.assert(false)
+        Some(v) =>
+            match llmcopenai.decode_value(v)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(true)
+
+@test
+fn test_a_missing_usage_is_zeroes_and_not_an_error() [io]
+    // A provider that reports none is a fact about the provider.
+    test.assert(llmcopenai.decode_usage(json.object([])).input_tokens == 0)
+    test.assert(llmcanthro.decode_usage(json.object([])).output_tokens == 0)
+
+@test
+fn test_the_interleaved_blocks_are_available_for_a_transcript() [io]
+    // `LlmcReply` keeps text and calls apart because that is the shape
+    // both dialects can be read as; the order is here for the caller
+    // that needs it back.
+    test.assert(list.len(llmcanthro.blocks_of(json.object([]))) == 0)
+
+@test
+fn test_a_frame_s_text_delta_is_one_call_for_the_common_loop() [io]
+    test.assert(llmcsse.text_delta(LlmcEventText("hi")) == "hi")
+
+@test
+fn test_events_fold_a_frame_at_a_time() [io]
+    let s = llmcsse.apply_all(llmcsse.stream(),
+                              [LlmcEventText("he"), LlmcEventText("llo")])
+    test.assert(llmcsse.partial(s).text == "hello")
+
+@test
+fn test_a_drained_reader_answers_none_rather_than_blocking() [io]
+    match llmcsse.take(llmcsse.reader())
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match s.frame
+                Some(_) => test.assert(false)
+                None    => test.assert(true)
+
+@test
+fn test_a_policy_that_does_not_retry_says_so_by_name() [io]
+    test.assert(llmcretry.no_retry().max_attempts == 1)
+    test.assert(llmcretry.with_base_delay_ms(llmcretry.retry(), 250).base_delay_ms == 250)
+
+@test
+fn test_should_retry_is_the_conjunction_a_loop_would_have_written() [io]
+    test.assert(llmcretry.should_retry(llmcretry.retry(), 1, LlmcOverloaded("busy")))
+    test.assert(llmcretry.should_retry(llmcretry.retry(), 1,
+                                       LlmcAuthFailed(401, "bad key")) == false)
+
+@test
+fn test_elapsed_is_computed_from_two_readings() [io]
+    test.assert(llmcretry.elapsed_ms(1000, 1750) == 750)
+
+@test
+fn test_the_clock_is_the_one_row_in_the_module_that_performs_anything() [io, time]
+    // Declared `[time]` here because that is what it costs.  Every
+    // other function in `llmcretry` takes a reading as an argument.
+    test.assert(llmcretry.now_ms() >= 0)

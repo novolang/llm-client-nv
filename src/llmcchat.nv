@@ -1,0 +1,334 @@
+// llmcchat.nv — the client: one call, either dialect, whatever the
+// caller's transport costs.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// EVERY SESSION FUNCTION HERE IS EFFECT-POLYMORPHIC.  `send` declares
+// `[e]` and is charged what the transport behind `T` supplies — `[net]`
+// over TLS, `[io, net, time, async]` over the standard library's HTTP
+// client, nothing at all over a recorded transcript.  The encode and
+// decode halves are `[]` and published separately, so a caller that
+// holds its own connection — an HTTP/2 pool, a proxy, a test double —
+// uses this package without its transport at all.
+//
+// `send_retrying` IS `[e, time]` AND IT SLEEPS.  That is the honest
+// row: a retry loop waits, waiting is `core.rt.sleep_ms`, and
+// `core.rt.sleep_ms` is `[time]`.  A caller that will not spend
+// `[time]` calls `send` in its own loop with
+// `llmcretry.next_delay_ms`, which is where the delay arithmetic
+// lives and which costs nothing.
+//
+// THERE IS NO SESSION HANDLE AND NO HIDDEN HISTORY.  `std.llm.session`
+// keeps the conversation inside the runtime, on the far side of an FFI
+// boundary, and novoagent's own loop comment records what that cost
+// it: the transcript grew twice, once in the program's control and
+// once outside it, so the agent went through the stateless `ask` and
+// rebuilt the prompt itself.  Here the conversation is a `PromptConvo`
+// the caller owns, every call takes one and returns a reply, and a
+// context manager can evict from it because it can see it.
+
+use std.list
+use llmcreq
+use llmcreply
+use llmcretry
+use llmcsse
+use llmchttp
+
+// A configured client: a provider, a retry policy and a deadline.
+//
+// Holds no connection.  The transport is an argument to every call,
+// which is what lets one client serve a pool, a test double and a
+// one-shot socket without three constructors.
+pub struct LlmcClient
+    provider: LlmcProvider
+    retry: LlmcRetry
+    // The whole-request budget in milliseconds, retries included.
+    // Separate from a transport's per-read deadline, because "no
+    // answer in 30 seconds" and "no byte in 30 seconds" are different
+    // promises and a streaming reply keeps the second one for minutes.
+    deadline_ms: Int
+
+// A client for a provider, with the default retry policy.
+//
+// ```novo
+// use llmcchat
+// use llmcreq
+//
+// fn main() [io]
+//     println("${llmcchat.client(llmcreq.openai("sk-test")).deadline_ms}")
+// ```
+pub fn client(p: LlmcProvider) -> LlmcClient []
+    todo("llm-client-nv.llmcchat.client")
+
+// The same client with another retry policy.
+//
+// ```novo
+// use llmcchat
+// use llmcreq
+// use llmcretry
+//
+// fn main() [io]
+//     let c = llmcchat.with_retry(llmcchat.client(llmcreq.openai("sk-test")),
+//                                 llmcretry.no_retry())
+//     println("${c.retry.max_attempts}")
+//     // : 1
+// ```
+pub fn with_retry(c: LlmcClient, p: LlmcRetry) -> LlmcClient []
+    todo("llm-client-nv.llmcchat.with_retry")
+
+// The same client with another whole-request deadline.
+//
+// ```novo
+// use llmcchat
+// use llmcreq
+//
+// fn main() [io]
+//     let c = llmcchat.with_deadline_ms(llmcchat.client(llmcreq.openai("sk-test")), 120000)
+//     println("${c.deadline_ms}")
+//     // : 120000
+// ```
+pub fn with_deadline_ms(c: LlmcClient, ms: Int) -> LlmcClient []
+    todo("llm-client-nv.llmcchat.with_deadline_ms")
+
+// The request body this client would send, in this client's dialect.
+//
+// `[]`.  The half of `send` that does not perform, published so a
+// caller can log it, sign it, cache it, or send it over a transport
+// this package has never heard of.
+//
+// ```novo
+// use llmcchat
+// use llmcreq
+// use promptmsg
+//
+// fn body(c: LlmcClient, r: LlmcRequest) -> Bool
+//     match llmcchat.encode(c, r)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode(c: LlmcClient, r: LlmcRequest) -> Result<[u8], LlmcFault> []
+    todo("llm-client-nv.llmcchat.encode")
+
+// Every header this client would send for this request.
+//
+// The provider's authentication and version headers, `Content-Type`,
+// `Accept: text/event-stream` when the request streams, and the
+// idempotency key when the policy has one.
+//
+// ```novo
+// use llmcchat
+// use llmcreq
+//
+// fn headers(c: LlmcClient, r: LlmcRequest) -> Int
+//     list.len(llmcchat.headers_for(c, r))
+// ```
+pub fn headers_for(c: LlmcClient, r: LlmcRequest) -> [Str] []
+    todo("llm-client-nv.llmcchat.headers_for")
+
+// A response this client would have received, as a reply or a fault.
+//
+// `[]`.  The other half of `send`, and the one a recorded transcript
+// test drives directly: a status, the header lines and the body are
+// all a decoder needs, and every provider-specific error shape is
+// behind this one call.
+//
+// ```novo
+// use llmcchat
+// use llmcreq
+//
+// fn read(c: LlmcClient, body: [u8]) -> Bool
+//     match llmcchat.decode(c, 200, [], body)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn decode(c: LlmcClient, status: Int, headers: [Str],
+              body: [u8]) -> Result<LlmcReply, LlmcFault> []
+    todo("llm-client-nv.llmcchat.decode")
+
+// One SSE frame decoded in this client's dialect.
+//
+// `[]`.  The streaming counterpart of `decode`, so a caller driving
+// its own read loop never names a dialect module.
+//
+// ```novo
+// use llmcchat
+// use llmcsse
+//
+// fn evs(c: LlmcClient, f: LlmcSseFrame) -> Bool
+//     match llmcchat.decode_frame(c, f)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn decode_frame(c: LlmcClient, f: LlmcSseFrame) -> Result<[LlmcEvent], LlmcFault> []
+    todo("llm-client-nv.llmcchat.decode_frame")
+
+// Send one request and read one reply.
+//
+// ONE EXCHANGE.  No retry, no sleep, no clock — so the row is exactly
+// the transport's, and a caller that wants a retry loop writes one
+// around this with `llmcretry.next_delay_ms` deciding the waits.
+//
+// ```novo ignore
+// use llmcchat
+// use llmchttp
+//
+// fn ask(c: LlmcClient, t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net]
+//     llmcchat.send(c, t, r)
+// ```
+pub fn send<T: LlmcTransport[e]>(c: LlmcClient, t: T,
+                                 r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [e]
+    todo("llm-client-nv.llmcchat.send")
+
+// Send one request, retrying by the client's policy, sleeping between
+// attempts.
+//
+// `[e, time]`: the transport's row plus the clock and the sleep.  The
+// uniforms for the jitter come from the caller, one per attempt, for
+// the reason `llmcretry`'s header gives — a retry schedule that is a
+// pure function of its inputs is one a test can assert.
+//
+// ```novo ignore
+// use llmcchat
+// use llmchttp
+//
+// fn ask(c: LlmcClient, t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net, time]
+//     llmcchat.send_retrying(c, t, r, [0.5, 0.5])
+// ```
+pub fn send_retrying<T: LlmcTransport[e]>(c: LlmcClient, t: T, r: LlmcRequest,
+                                          us: [Float]) -> Result<LlmcReply, LlmcFault> [e, time]
+    todo("llm-client-nv.llmcchat.send_retrying")
+
+// Open a streamed request and answer the reader to drain.
+//
+// The head only: the body stays on the wire and `stream_next` pulls
+// from it.  A caller that wants the frames itself uses
+// `llmchttp.llmc_read` and `llmcsse.feed` directly; this is the pair
+// that keeps the dialect out of the loop.
+//
+// ```novo ignore
+// use llmcchat
+// use llmchttp
+//
+// fn open(c: LlmcClient, t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcStreamState, LlmcFault> [net]
+//     llmcchat.stream_open(c, t, r)
+// ```
+pub fn stream_open<T: LlmcTransport[e]>(c: LlmcClient, t: T,
+                                        r: LlmcRequest) -> Result<LlmcStreamState, LlmcFault> [e]
+    todo("llm-client-nv.llmcchat.stream_open")
+
+// A streamed reply in progress: the frame reader, the accumulator and
+// the client's dialect.
+//
+// A VALUE the caller holds and threads through `stream_next`, so the
+// loop is the caller's and the state is inspectable — which is what
+// `std.llm.stream`'s callback cannot be, and what makes a terminal
+// that repaints per delta and an agent that counts tokens the same
+// two lines of code.
+pub struct LlmcStreamState
+    reader: LlmcSseReader
+    acc: LlmcStream
+    dialect: LlmcDialect
+    // How many bytes have been read off the wire, for a caller that
+    // wants to bound a stream it does not trust.
+    read_bytes: Int
+
+// Read more of a stream and answer the events it completed.
+//
+// An EMPTY event list means the bytes read did not finish a frame, not
+// that the stream ended: `llmcsse.finished` on `state.acc` is the end
+// condition, and `llmcsse.finish` is what turns it into a reply.
+//
+// ```novo ignore
+// use llmcchat
+// use llmchttp
+//
+// fn pump(c: LlmcClient, t: LlmcTlsHttp, s: LlmcStreamState) -> Result<LlmcStreamStep, LlmcFault> [net]
+//     llmcchat.stream_next(c, t, s)
+// ```
+pub fn stream_next<T: LlmcTransport[e]>(c: LlmcClient, t: T,
+                                        s: LlmcStreamState) -> Result<LlmcStreamStep, LlmcFault> [e]
+    todo("llm-client-nv.llmcchat.stream_next")
+
+// A stream's state and the events one read produced.
+pub struct LlmcStreamStep
+    state: LlmcStreamState
+    events: [LlmcEvent]
+
+// Whether a model's answer matches the schema the request asked for.
+//
+// **`strict` IS A PROMISE AND THIS IS THE PROOF.**  OpenAI's own
+// endpoint constrains decoding to the schema; several servers that
+// speak the same dialect accept the field and prompt for it instead,
+// and the Anthropic dialect has no `response_format` at all — this
+// package obtains the shape there by forcing a single tool, which the
+// model can still fill in wrongly.  So a caller that asked for a shape
+// and needs one calls this, and schema-nv answers which instance
+// location failed rather than a boolean.
+//
+// `Ok` with no faults for a request whose format was `LlmcFormatText`:
+// a caller that did not ask for a shape is not failing to match one.
+//
+// ```novo
+// use llmcchat
+// use llmcreq
+// use llmcreply
+//
+// fn valid(r: LlmcRequest, reply: LlmcReply) -> Bool
+//     match llmcchat.validate_format(r, reply)
+//         Ok(fs) => list.len(fs) == 0
+//         Err(_) => false
+// ```
+pub fn validate_format(r: LlmcRequest, reply: LlmcReply) -> Result<[Str], LlmcFault> []
+    todo("llm-client-nv.llmcchat.validate_format")
+
+// The conversation with this reply's turn appended.
+//
+// The one line an agent loop writes between turns, and the one that
+// leaves the tool obligations visible: `llmcreply.owed_tool_results`
+// on the same reply is what must be answered next, and
+// `llmcreq.check` refuses the request that does not.
+//
+// ```novo
+// use llmcchat
+// use llmcreply
+// use promptmsg
+//
+// fn turn(c: PromptConvo, r: LlmcReply) -> Int
+//     promptmsg.turn_count(llmcchat.append_reply(c, r))
+// ```
+pub fn append_reply(c: PromptConvo, r: LlmcReply) -> PromptConvo []
+    todo("llm-client-nv.llmcchat.append_reply")
+
+// The conversation with one tool result appended, answering one call.
+//
+// Takes the CALL and not a name, because a turn with two calls to one
+// tool produces two results that differ only by id — and a loop that
+// keyed on the name answers the first call twice and the second never.
+//
+// ```novo
+// use llmcchat
+// use llmcreply
+// use promptmsg
+//
+// fn answered(c: PromptConvo, call: LlmcToolCall) -> Int
+//     promptmsg.turn_count(llmcchat.append_tool_result(c, call, "17 degrees"))
+// ```
+pub fn append_tool_result(c: PromptConvo, call: LlmcToolCall, content: Str) -> PromptConvo []
+    todo("llm-client-nv.llmcchat.append_tool_result")
+
+// What this client would ask for, as one line, with the key redacted.
+//
+// For a log: the dialect, the origin, the model, whether it streams
+// and how many tools it offers.  The key never appears — `redacted` is
+// the reason `llmcreq` publishes it.
+//
+// ```novo
+// use llmcchat
+// use llmcreq
+// use promptmsg
+//
+// fn line(c: LlmcClient, r: LlmcRequest) -> Str
+//     llmcchat.describe(c, r)
+// ```
+pub fn describe(c: LlmcClient, r: LlmcRequest) -> Str []
+    todo("llm-client-nv.llmcchat.describe")

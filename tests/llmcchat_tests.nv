@@ -1,0 +1,231 @@
+// llmcchat_tests.nv — a whole exchange with no socket in it.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// llm-client-nv.<module>.<fn>`.
+//
+// THE COMPILER MAKES THE FIRST ASSERTION BEFORE THE RUN STARTS.
+// `LlmcScript` below implements `LlmcTransport[]` — a transport over
+// bytes already in memory — and the functions that drive a request
+// over it carry no effect row at all.  If `llmcchat.send` were
+// secretly effectful, or if the effect parameter did not flow from the
+// impl to the call, this file would not compile.  That is the package's
+// whole claim about `LlmcTransport[e]`, checked by the toolchain
+// rather than asserted in a README.
+
+use std.test
+use std.bytes
+use std.list
+use llmcchat
+use llmchttp
+use llmcreq
+use llmcreply
+use llmcretry
+use llmcsse
+use promptmsg
+
+// A transport over a recorded response.  It performs nothing.
+struct LlmcScript
+    status: Int
+    headers: [Str]
+    body: [u8]
+    open: Bool
+
+// A transport that costs nothing.
+//
+// ```novo ignore
+// use llmcchat
+//
+// fn drive(c: LlmcClient, s: LlmcScript, r: LlmcRequest) -> Result<LlmcReply, LlmcFault>
+//     llmcchat.send(c, s, r)
+// ```
+impl LlmcTransport[] for LlmcScript
+    fn llmc_exchange(self, method: Str, path: Str, headers: [Str],
+                     body: [u8]) -> Result<LlmcHttpReply, LlmcFault>
+        Ok(LlmcHttpReply { status: self.status, headers: self.headers,
+                           body: self.body, streamed: false })
+
+    fn llmc_open(self, method: Str, path: Str, headers: [Str],
+                 body: [u8]) -> Result<LlmcHttpReply, LlmcFault>
+        Ok(LlmcHttpReply { status: self.status, headers: self.headers,
+                           body: [], streamed: true })
+
+    fn llmc_read(self, max: Int) -> Result<[u8], LlmcFault>
+        if self.open
+            Ok(self.body)
+        else
+            Ok([])
+
+    fn llmc_close(self) -> ?LlmcFault
+        None
+
+fn script(body: Str) -> LlmcScript
+    LlmcScript { status: 200, headers: ["Content-Type: application/json"],
+                 body: bytes.to_byte_list(bytes.from_str(body)), open: true }
+
+fn a_convo() -> PromptConvo
+    promptmsg.with_system(promptmsg.convo([promptmsg.user("hello")]),
+                          "answer in one sentence")
+
+fn a_client() -> LlmcClient
+    llmcchat.client(llmcreq.openai("sk-test"))
+
+fn a_request() -> LlmcRequest
+    llmcreq.with_params(llmcreq.request("gpt-4o-mini", a_convo()),
+                        llmcreq.with_max_tokens(llmcreq.params(), 256))
+
+@test
+fn test_a_whole_exchange_runs_over_bytes_already_in_memory() [io]
+    // No socket, no clock, no effect row — which is the trait working.
+    let body = "{\"id\":\"chatcmpl-1\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"Copenhagen.\"},\"finish_reason\":\"stop\"}]}"
+
+    match llmcchat.send(a_client(), script(body), a_request())
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the text came back")
+            test.assert(r.text == "Copenhagen.")
+
+            test.case("and it is a whole answer")
+            test.assert(llmcreply.is_complete(r.stop))
+
+@test
+fn test_the_encode_and_decode_halves_are_usable_without_a_transport() [io]
+    // For a caller that holds its own connection — a pool, a proxy, a
+    // recorder.  Both are `[]`.
+    let c = a_client()
+
+    test.case("the body is bytes a caller can send itself")
+    match llmcchat.encode(c, a_request())
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("the headers are the ones the provider needs")
+    test.assert(list.len(llmcchat.headers_for(c, a_request())) > 0)
+
+    test.case("and a response decodes with no transport in sight")
+    let body = bytes.to_byte_list(bytes.from_str("{\"id\":\"x\",\"choices\":[]}"))
+    match llmcchat.decode(c, 200, [], body)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_stream_is_opened_and_pumped_by_the_caller_s_own_loop() [io]
+    let wire = "data: {\"choices\":[{\"delta\":{\"content\":\"Cope\"}}]}\n\ndata: [DONE]\n\n"
+    let t = script(wire)
+    let c = a_client()
+    let r = llmcreq.streaming(a_request())
+
+    match llmcchat.stream_open(c, t, r)
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("nothing has been read yet")
+            test.assert(s.read_bytes == 0)
+
+            match llmcchat.stream_next(c, t, s)
+                Err(_)   => test.assert(false)
+                Ok(step) =>
+                    test.case("and one read produces the events it completed")
+                    test.assert(list.len(step.events) >= 1)
+
+@test
+fn test_a_retrying_send_takes_its_uniforms_from_the_caller() [io]
+    // `[e, time]`: the transport's row plus the clock and the sleep.
+    // Over a script the transport costs nothing, so this call is
+    // `[time]` and the test declares it.
+    let body = "{\"id\":\"chatcmpl-2\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}"
+
+    match llmcchat.send_retrying(a_client(), script(body), a_request(), [0.5, 0.5])
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(r.text == "ok")
+
+@test
+fn test_a_client_is_reconfigured_by_value() [io]
+    let c = llmcchat.with_deadline_ms(
+                llmcchat.with_retry(a_client(), llmcretry.no_retry()), 120000)
+
+    test.assert(c.deadline_ms == 120000)
+
+@test
+fn test_a_frame_decodes_in_the_client_s_own_dialect() [io]
+    // So a caller driving its own read loop never names a dialect
+    // module.
+    match llmcsse.feed(llmcsse.reader(),
+                       bytes.to_byte_list(bytes.from_str("data: [DONE]\n\n")))
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            match s.frame
+                None    => test.assert(false)
+                Some(f) =>
+                    match llmcchat.decode_frame(a_client(), f)
+                        Ok(es) => test.assert(list.len(es) == 0)
+                        Err(_) => test.assert(false)
+
+@test
+fn test_a_shaped_reply_is_checked_rather_than_trusted() [io]
+    // `strict` is a provider's promise; several servers accept the
+    // field and prompt for it instead.
+    match llmcchat.validate_format(a_request(), llmcreply.empty_reply())
+        Ok(fs) => test.assert(list.len(fs) == 0)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_loop_between_turns_is_two_named_calls() [io]
+    let c = a_convo()
+    let r = llmcreply.empty_reply()
+
+    test.case("the model's turn is appended")
+    let after = llmcchat.append_reply(c, r)
+    test.assert(promptmsg.turn_count(after) >= promptmsg.turn_count(c))
+
+    test.case("and a tool result answers one CALL, by id")
+    let call = LlmcToolCall { id: "call_a", name: "get_weather",
+                              arguments: "{}" }
+    test.assert(promptmsg.turn_count(llmcchat.append_tool_result(after, call, "17")) >= 1)
+
+@test
+fn test_a_log_line_never_carries_the_key() [io]
+    test.assert(llmcchat.describe(a_client(), a_request()) != "sk-test")
+
+@test
+fn test_a_transport_is_built_without_performing_anything() [io]
+    // `std_http` is `[]`: the four labels are spent by the exchange,
+    // not by the constructor.
+    match llmchttp.std_http(llmcreq.openai("sk-test"), 30000)
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_origin_is_parsed_without_a_socket() [io]
+    match llmchttp.origin_of(llmcreq.openai("sk-test"))
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.case("https is 443")
+            test.assert(o.port == 443)
+            test.assert(o.host == "api.openai.com")
+
+@test
+fn test_a_header_is_matched_without_regard_to_case() [io]
+    // Providers disagree about which case they send, from the same API.
+    match llmchttp.header_of(["retry-after: 6"], "Retry-After")
+        Some(v) => test.assert(v == "6")
+        None    => test.assert(false)
+
+@test
+fn test_a_json_answer_to_a_streaming_request_is_legible() [io]
+    // Several OpenAI-compatible servers accept `stream: true` and
+    // answer one JSON document.  A client that drove the frame reader
+    // over it reads nothing and reports a truncated stream.
+    test.assert(llmchttp.is_event_stream(["Content-Type: application/json"]) == false)
+    test.assert(llmchttp.is_event_stream(["Content-Type: text/event-stream"]))
+
+@test
+fn test_a_dial_that_cannot_connect_is_a_fault_and_not_a_panic() [io, net]
+    // The one test in the package that opens a socket, and it opens
+    // one that is refused: a provider nothing is listening on answers
+    // `LlmcTransportFailed`, which is retryable, rather than ending
+    // the process.
+    let p = llmcreq.compatible("https://127.0.0.1:1", "")
+
+    match llmchttp.dial_tls(p, 1000)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

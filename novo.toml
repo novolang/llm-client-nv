@@ -1,0 +1,68 @@
+[package]
+name        = "llm-client-nv"
+version     = "0.0.1"
+description = "One client for the hosted chat APIs: the OpenAI-compatible chat dialect and Anthropic's Messages dialect as sans-IO codec modules over the standard library's JSON value, prompt-nv's conversation as the input, tool calls and tool results as values, structured output through schema-nv, streaming as SSE frames a caller drains, retries with backoff and the rate-limit headers, and a token budget through tokenizers-nv.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and SEVEN OF THE NINE MODULES DECLARE NOTHING.  `llmcreq`,
+# `llmcreply`, `llmcopenai`, `llmcanthro`, `llmcsse` and `llmcfault`
+# are `[]` throughout — the two wire dialects, the reply, the event
+# stream and the faults are arithmetic over a JSON value and a byte
+# buffer the caller already holds.  What performs is `llmchttp`, and
+# the session calls in `llmcchat` are effect-polymorphic over the
+# transport trait and cost whatever the caller's transport costs.
+#
+# `layer = "host"` AND NOT `layer = "core"` WITH `host_modules`.  The
+# narrower declaration is for a package whose SUBJECT is the pure half.
+# This package's subject is talking to a server; the dialects are here
+# because a request has to be encoded before it travels, not the other
+# way round.
+layer       = "host"
+
+category    = "ai"
+
+tags        = ["llm", "openai", "anthropic", "chat", "tool-calling", "streaming", "sse"]
+repository  = "https://github.com/novolang/llm-client-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "One client, two wire dialects, and a reply that says how it ended"
+
+[dependencies]
+# The conversation this package sends.  `PromptMessage`, `PromptRole`
+# and `PromptConvo` are prompt-nv's first declaration — `std.llm`
+# defines no chat-message type at all — so this package renders that
+# type into each dialect rather than declaring a second one.  `core`,
+# so `dep-layer` holds.
+prompt-nv = "^0.0.1"
+
+# Structured output.  A response format is a JSON Schema document, and
+# `schcompile.compile` is what says the document is a schema before it
+# is sent to a provider that will answer 400 with a sentence rather
+# than a location.  `schvalidate.validate` is also how a caller checks
+# the model's answer against the schema it asked for, which matters
+# because "strict" is a provider's promise and not a proof.
+schema-nv = "^0.0.1"
+
+# The token budget.  `tokmodel.encode` is the count, and the README
+# says exactly what that count is worth against a hosted model whose
+# tokenizer is the provider's.
+tokenizers-nv = "^0.0.1"
+
+# HTTP/1.1 framing for the narrow transport.  `h1write.request` builds
+# the request bytes and `h1read` drains the response, so a client over
+# `std.tls` alone costs `[net]` and nothing else.  The wide transport
+# over `std.http` costs `[io, net, time, async]`, and the README has
+# the table.
+http-codec-nv = "^0.0.2"
