@@ -1,362 +1,371 @@
 # llm-client-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+A hosted chat API takes a conversation and answers one more turn of it. Two
+wire formats cover almost all of them: OpenAI's
+[Chat Completions API](https://platform.openai.com/docs/api-reference/chat),
+which many other servers also speak, and Anthropic's
+[Messages API](https://docs.anthropic.com/en/api/messages). This package is
+one client for both, in novo-lang. It is built on
+[prompt-nv](https://novo-lang.org/packages/prompt-nv), whose conversation
+type is the input, and on
+[schema-nv](https://novo-lang.org/packages/schema-nv),
+[tokenizers-nv](https://novo-lang.org/packages/tokenizers-nv) and
+[http-codec-nv](https://novo-lang.org/packages/http-codec-nv).
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What it is
 
-One client for the hosted chat APIs.  The two wire dialects that
-matter — the OpenAI-compatible chat API and Anthropic's Messages API —
-as sans-IO codec modules over the standard library's JSON value:
-request bodies, streaming event frames, tool-call and tool-result
-turns, usage.  prompt-nv's conversation goes in, a reply value comes
-out, retries know what the rate-limit headers said, and a token budget
-is checked before the round trip rather than after it.
+A **provider** is a base URL, an API key and a **dialect**, which is which
+of the two wire formats the server speaks. A **request** is a model name, a
+conversation, and the parameters that shape the answer. A **reply** is what
+came back: the text, why it stopped, any tool calls, and the **usage**, the
+token counts the provider billed.
 
-It is not an agent framework, not a prompt library and not an inference
-engine.  novoagent is the first, prompt-nv is the second, and
-orbit/novollm is the third.
+**Tool calling** is how a model asks the program to do something. The
+request carries **tool definitions**, each a name, a description and a JSON
+Schema for its arguments. The model may answer with **tool calls** instead
+of text. The program runs them and sends the results back as further turns,
+and the model answers again. Every call carries an **id**, and the next
+request must carry a result for every id the model emitted.
 
-## Adding it, and checking it
+**Structured output** is asking for an answer in a fixed shape. The OpenAI
+dialect has a `response_format` field for it. The Anthropic dialect has
+none, so this package obtains a shape there by forcing a single tool whose
+input schema is the shape.
 
-```bash
-novo pkg add llm-client-nv    # into your novo.toml
-novo pkg build                # type- and effect-check the package
-novo test --isolate tests/llmcreply_tests.nv
+**Streaming** sends the answer in pieces as it is generated, as
+**server-sent events**: a stream of frames, each a set of `field: value`
+lines, ending at a blank line. The format is the HTML Living Standard's
+`Server-sent events` section.
+
+A **transport** is whatever carries the bytes. This package declares a
+trait for one and ships two implementations, and the effects a program
+spends are the transport's.
+
+| Transport | Effects | What it is |
+| --- | --- | --- |
+| `LlmcTlsHttp` | `[net]` | `std.tls` for the socket, http-codec-nv for the framing |
+| `LlmcStdHttp` | `[io, net, time, async]` | the standard library's `HttpClient`, with redirects and connection reuse |
+
+Six of the nine modules declare no effects at all. `llmcretry.now_ms` is
+`[time]`, `llmchttp.dial_tls` is `[net]`, and the session calls in
+`llmcchat` cost whatever the transport they are handed costs.
+
+The two dialects differ in eleven places, and each difference is a refused
+request or a wrong answer for a client that assumed the other:
+
+| | OpenAI chat | Anthropic Messages |
+| --- | --- | --- |
+| System prompt | the first message in the array | a top-level field; a `system` role is refused |
+| `max_tokens` | optional, with a default | required, with no default |
+| Content | a string, with `tool_calls` beside it | a list of blocks, text and tool use interleaved |
+| A tool result | a `tool` role with a call id | a `user` message with a tool-result block |
+| "Call some tool" | `tool_choice: "required"` | `tool_choice: {"type": "any"}` |
+| JSON with no schema | `response_format: {"type":"json_object"}` | no spelling |
+| JSON with a schema | `json_schema` with `strict` | one forced tool whose input schema is the shape |
+| A seed | `seed` | no spelling |
+| Usage on a stream | only with `stream_options.include_usage` | always, on the message delta |
+| Stream frames | unnamed; the kind is inside the data | named in the `event:` field |
+| "At capacity" | status 503 | status 529 |
+
+## Install
+
+```
+novo pkg add llm-client-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: llm-client-nv.<module>.<fn>`.
-They turn green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
-use llmcchat
-use llmcfault
 use llmcreq
+use llmcchat
 use llmchttp
 use llmcreply
 use promptmsg
 
-// One turn against a hosted model, over the narrow transport.
-// `[net]` and nothing else: `std.tls` connects and http-codec-nv does
-// the framing.
+// Ask a hosted model one question. `[net]` is the whole cost: the TLS
+// transport opens the socket and http-codec-nv frames the exchange.
 fn ask(key: Str, question: Str) -> Result<Str, LlmcFault> [net]
+    // The key is the caller's. This package reads no environment.
     let p = llmcreq.anthropic(key)
     let c = llmcchat.client(p)
 
+    // One user turn, with a system instruction beside it.
     let convo = promptmsg.with_system(
                     promptmsg.convo([promptmsg.user(question)]),
                     "answer in one sentence")
+
+    // The Anthropic dialect requires a token cap, so the request
+    // carries one.
     let r = llmcreq.with_params(llmcreq.request("claude-haiku-4-5", convo),
                                 llmcreq.with_max_tokens(llmcreq.params(), 256))
 
-    let t = llmchttp.dial_tls(p, 30000)!
+    // The type annotation is needed: `send` is generic over the
+    // transport, and a binding written from `expr!` does not close it.
+    let t: LlmcTlsHttp = llmchttp.dial_tls(p, 30000)!
     let reply = llmcchat.send(c, t, r)!
 
-    // READ THIS BEFORE THE TEXT.  A reply that hit the cap is a prefix
-    // that reads exactly like an answer.
+    // How the reply ended, before its text is read: one that hit the
+    // cap is a prefix that reads like a whole answer.
     if llmcreply.is_truncated(reply)
         return Err(LlmcBadEncoding(llmcreply.stop_note(reply.stop)))
     Ok(reply.text)
+
+fn main() [io, net]
+    match ask("your-api-key", "what is the capital of Denmark?")
+        Ok(text) => println(text)
+        Err(f)   => println(f.message())
 ```
 
-The key comes from the caller.  This package reads no environment
-variable, and the section below says why.
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: llm-client-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-## The layer, and why
+## What the package contains
 
-`host`, and seven of the nine modules declare nothing.
+| Module | Contents |
+| --- | --- |
+| `llmcreq` | The provider, the request and its parameters, tool definitions, the response format, the local checks, and the token estimate. |
+| `llmcreply` | Why a reply ended, the tool calls it carried, the usage, and the conversions back into conversation turns. |
+| `llmcopenai` | The OpenAI chat dialect: the request body, the reply, the errors and the stream frames. |
+| `llmcanthro` | The Anthropic Messages dialect, the same way, with its own base URL, path and version header. |
+| `llmcsse` | The server-sent event reader, and the accumulator that turns a stream of events into one reply. |
+| `llmcretry` | The retry policy, the rate-limit headers, the backoff arithmetic, the idempotency key, and the one clock read. |
+| `llmchttp` | The transport trait and its two implementations, plus the header and origin helpers. |
+| `llmcchat` | The client: encoding, decoding, one exchange, one exchange with retries, and a streaming session. |
+| `llmcfault` | The twelve ways a call fails, whether each is worth retrying, and the status it came from. |
 
-| module | row | why |
-| --- | --- | --- |
-| `llmcfault` | `[]` throughout | a fault is a value built from a status and a body |
-| `llmcreq` | `[]` throughout | the request, the provider, and the token count |
-| `llmcreply` | `[]` throughout | the reply, and the two states a `Str` cannot be in |
-| `llmcopenai` | `[]` throughout | the OpenAI chat dialect; sans-IO by construction |
-| `llmcanthro` | `[]` throughout | the Anthropic Messages dialect, likewise |
-| `llmcsse` | `[]` throughout | the event-frame reader, feed and drain |
-| `llmcretry.now_ms` | `[time]` | the one function in the package that reads a clock |
-| everything else in `llmcretry` | `[]` | the policy, the headers and the delay arithmetic |
-| `llmchttp.dial_tls` | `[net]` | `std.tls`'s own row |
-| `LlmcTlsHttp`'s methods | `[net]` | TLS plus http-codec-nv's `[]` framing |
-| `LlmcStdHttp`'s methods | `[io, net, time, async]` | `std.http`'s `HttpClient` declares all four |
-| every session call in `llmcchat` | `[e]` | effect-POLYMORPHIC: whatever the transport costs |
-| `llmcchat.send_retrying` | `[e, time]` | it sleeps between attempts, and a sleep is `[time]` |
+## How to choose an entry point
 
-`layer = "host"` and **not** `layer = "core"` with `host_modules`.  The
-narrower declaration is for a package whose *subject* is the pure half.
-This package's subject is talking to a server; the dialects are here
-because a request has to be encoded before it travels.
+**`llmcchat.send` performs one exchange.** Use it when the caller owns the
+retry loop or wants none. **`send_retrying` performs the loop**, and it
+sleeps between attempts, so its effects are the transport's plus `[time]`.
 
-**The headline row is `[net, time]`, and the wide transport is named
-rather than hidden.**  A program that uses `LlmcTlsHttp` spends `[net]`
-for the socket and `[time]` for the clock and the sleep, and nothing
-else.  A program that wants redirects, connection reuse and the
-standard library's chunked decoder uses `LlmcStdHttp` and spends
-`[io, net, time, async]`, because that is `HttpClient.send`'s own row.
-Publishing both is the reason `LlmcTransport[e]` exists: a library that
-shipped only the second would have put `[async]` on the row of every
-program that asks a model a question, including a synchronous batch job
-and a one-shot in a CLI.
+**`llmcchat.stream_open` and `stream_next` are a streaming session.** They
+hold a `LlmcStreamState` the caller threads through its own loop, so the
+loop lives where the caller wants it: a terminal repainting per delta, a
+server forwarding to its own client, and an agent counting tokens each want
+a different one.
 
-## The load-bearing interface
+**`llmcchat.encode`, `headers_for` and `decode` are the exchange taken
+apart**, for a caller with a transport this package does not know, a
+recorder, or a test.
 
-**`LlmcReply.stop`, and `llmcreply.owed_tool_results` beside it.**
+**`LlmcTlsHttp` costs `[net]` and `LlmcStdHttp` costs `[io, net, time,
+async]`.** Take the first unless you need redirects, connection reuse or
+the standard library's chunked decoder. A library that shipped only the
+second would put `[async]` on every program that asks a model a question.
 
-`std.llm` answers `?Str`.  So does the convenience accessor on every
-provider SDK, and so does nearly every thin wrapper anybody writes over
-one.  A `Str` cannot be in the two states a chat reply is most often
-in, and **both of them are invisible in the text**.
+**The two dialect modules are usable on their own.** `llmcopenai` and
+`llmcanthro` declare no effects and take and answer JSON values, which is
+what a proxy, a recorder or a server needs.
 
-**A reply that hit the token cap is a truncated answer with no marker
-in it.**  The status is 200, `content` is a string, and it stops
-wherever the cap fell — sometimes mid-word, sometimes at a sentence
-boundary that happened to land there.  A summariser that stored it
-stored half a summary.  A structured-output call that hit the cap
-produced JSON with no closing brace, and the parse failure gets
-reported against the model's competence rather than against the
-caller's own `max_tokens`.
+## The rules a user needs
 
-**A reply that is a tool call has no text at all**, and the
-conversation is now in a state with an obligation in it: the very next
-request must carry a result for *every* call id the model emitted.  The
-two dialects punish an unmet obligation differently — Anthropic refuses
-the next request with a 400 naming the id, and the OpenAI dialect
-accepts it and lets the model answer as though the tool had returned
-nothing.  The second is the worse failure, because it produces a
-plausible sentence and no error anywhere.
+1. **Check how a reply ended before reading its text.** A reply that hit
+   the token cap is a prefix with no marker in it: the status is 200 and
+   the text stops where the cap fell. `llmcreply.is_complete` is true only
+   for `LlmcStopEnd` and `LlmcStopSequence`, and `is_truncated` is the
+   question the other way round.
+2. **A reply that is a tool call usually has no text.** `LlmcStopToolUse`
+   means the turn was the calls in `tool_calls`.
+3. **The next request must answer every tool call id.**
+   `llmcreply.owed_tool_results` lists them and `llmcreq.check` refuses a
+   request that leaves one open. The two dialects punish an unmet
+   obligation differently: the Anthropic API refuses the request and names
+   the id, and the OpenAI dialect accepts it and lets the model answer as
+   though the tool returned nothing. The second is worse, because it
+   produces a plausible sentence and no error.
+4. **`llmcreq.check` runs before a byte travels.** It refuses a request
+   with no `max_tokens` against the Anthropic dialect, a seed against the
+   Anthropic dialect, two tools with one name, a tool name the providers
+   refuse, a forced tool choice with no tools, and a conversation whose
+   tool results do not match its tool calls. A client that dropped an
+   unsupported field quietly would leave a caller believing a run is
+   reproducible when it is not.
+5. **A tool name is letters, digits, underscores and hyphens, 1 to 64
+   characters.** Both providers refuse anything else.
+   `llmcreq.is_tool_name` is the check.
+6. **The model name is bare.** This package takes `gpt-4o-mini`, not
+   `openai:gpt-4o-mini`, because the provider is the `LlmcProvider` value.
+   `is_model_name` refuses the qualified form, which otherwise produces a
+   404 that reads exactly like a rejected key.
+7. **`strict` is a promise and not a proof.** OpenAI's own endpoint
+   constrains decoding to the schema; several servers speaking the same
+   dialect accept the field and prompt for it instead, and the forced-tool
+   route on the Anthropic dialect can still be filled in wrongly.
+   `llmcchat.validate_format` checks the reply against the schema that was
+   asked for and answers which instance locations failed.
+8. **An SSE frame ends at a blank line, not at a newline.** A reader that
+   emitted one frame per line splits a JSON document into pieces.
+9. **`data: [DONE]` is not JSON.** A reader that parsed every frame reports
+   a malformed reply at the end of every successful stream.
+   `llmcsse.is_done` is the check.
+10. **Tool-call arguments arrive split at arbitrary byte boundaries.**
+    There is a point in every tool-calling stream where the arguments are
+    an unfinished JSON fragment. They accumulate as text and are parsed
+    once, which is why `LlmcToolCall.arguments` is a `Str` and
+    `arguments_json` is a separate call.
+11. **A stream that ends with no terminal event is a truncated reply.**
+    `llmcsse.finish` answers `LlmcStreamTruncated`, and `partial` is the
+    accessor for a caller that wants to show the text anyway.
+12. **A retry reads what the response said.** `Retry-After` (RFC 9110
+    section 10.2.3) and the providers' own reset headers say how long to
+    wait. `llmcretry.limits_of` reads them and `next_delay_ms` uses them. A
+    client using only its own backoff either retries too early and gets a
+    second refusal, or waits a minute when it was told two seconds.
+13. **A 429 is two different limits.** Requests per minute and tokens per
+    minute reset at different times, and one large request can exhaust the
+    token budget while the request budget is untouched. `LlmcRateLimit`
+    carries both.
+14. **A POST that timed out may have been executed.** The completion was
+    generated and billed and the reply was lost coming back, so a retry
+    produces and bills a second one. `LlmcRetry.idempotency_key` is a field
+    rather than a convenience, and `llmcretry.idempotency_headers` is what
+    a loop sends.
+15. **Status 529 is not a server error.** It is the Anthropic API saying it
+    is at capacity, and its right answer is a longer wait rather than a
+    faster retry. `LlmcOverloaded` is its own variant.
+16. **The retry jitter takes a uniform as an argument.** A backoff schedule
+    is then a pure function of the policy, the attempt and the uniform
+    sequence, so a test asserts numbers rather than ranges.
+17. **A token count against a hosted model is an estimate.** The provider's
+    tokenizer is not published. Against a local model whose `tokenizer.json`
+    the caller read it is exact. `LlmcReply.usage` is the truth in both
+    cases, and it arrives after the money is spent.
+18. **Tool definitions are usually the largest part of a request.** A
+    thirty-tool catalogue is sent on every turn of an agent loop.
+    `llmcreq.tools_tokens` counts it on its own.
+19. **The key is a `Str` the caller supplies.** This package reads no
+    environment variable. Reading one costs `[io]`, it is process-global
+    state a test cannot set per case, and it decides for the program which
+    key it uses. The names the providers document are `OPENAI_API_KEY`,
+    `ANTHROPIC_API_KEY` and `GROQ_API_KEY`. `llmcreq.redacted` is published
+    beside the provider value, because the second thing that happens to a
+    key is that somebody prints it.
+20. **`llmcreq.check_budget` takes the limit as an argument.** There is no
+    table of models and context windows in this package, because such a
+    table is wrong within a month and a client that shipped one would
+    refuse models that exist.
 
-So `LlmcReply` carries `stop`, `text`, `tool_calls` and `usage`
-together; `llmcreply.is_complete` is one call; and
-`owed_tool_results` is **published**, so an agent loop asserts the
-obligation rather than remembering it.  `llmcreq.check` is the same
-rule at the other end: it refuses a request whose conversation leaves
-an obligation open, before the bytes go out.
+## What is not included
 
-## What `std.llm` keeps, and how a program moves
-
-`std.llm` is not replaced and this package does not wrap it.  They sit
-at different levels, and the table is the whole of the difference.
-
-| | `std.llm` | llm-client-nv |
-| --- | --- | --- |
-| shape | a handle: `open`, `ask`, `session`, `chat` | values: a provider, a request, a reply |
-| transport | a curl subprocess, LLVM only, not embedded | your transport, through `LlmcTransport[e]` |
-| effects | `[io, ai]` | `[net, time]`, or the transport's |
-| the key | read from `ANTHROPIC_API_KEY` and its siblings | a `Str` the caller supplies |
-| a failure | `?Str`, plus a **process-wide** `last_error` | `LlmcFault`, per call, twelve variants |
-| history | inside the session handle, across an FFI boundary | a `PromptConvo` the caller owns |
-| tool calling | `with_tools` is **not implemented** and always answers `None` | tool calls and results as values, both dialects |
-| streaming | a callback, degraded on the compiled leg to one call | frames a caller drains, with the loop where the caller wants it |
-| structured output | `ask_json`, which parses and checks nothing | schema-nv's compiled schema, and `validate_format` |
-| a truncated reply | indistinguishable from a whole one | `LlmcStopMaxTokens` |
-
-**What `std.llm` keeps**, and should: the one-line ask.
-`LlmClient.open("anthropic:claude-haiku-4-5").ask(q)` is three tokens of
-ceremony for a script, it needs no dependency, and it works.  The
-handle, the subprocess behind it and the `[io, ai]` row are the price
-of that, and they are the right price for the thing it is.
-
-**How a program moves.**  A program outgrows it at the first of these:
-it needs to know *why* a call failed while another call is in flight
-(`last_error` is process-wide); it needs the conversation in its own
-hands (novoagent's loop comment records going through the stateless
-`ask` for exactly this reason — the transcript grew twice, once inside
-its control and once outside it); it needs tool calling at all; or it
-needs to know that a reply was cut off.  The move is mechanical:
-`llm.open(id)` becomes `llmcreq.anthropic(key)` plus
-`llmcchat.client`, `llm.ask(h, q)` becomes a `PromptConvo` and
-`llmcchat.send`, and `?Str` becomes `Result<LlmcReply, LlmcFault>`.
-The one naming difference is the model id: `std.llm` takes
-`openai:gpt-4o-mini` and this package takes the bare `gpt-4o-mini`
-with the provider chosen by the `LlmcProvider` value.  `is_model_name`
-refuses the qualified form by name, because sending it produces a 404
-that reads exactly like a rejected key.
-
-## The provider is a value, and this package reads no environment
-
-`std.llm` reads the key for you.  A library should not, for three
-reasons:
-
-- **It decides for the program which key it uses.**  A program that
-  talks to two accounts, or one per tenant, or through a gateway with a
-  rotating token, cannot say so to an API whose key comes from a name
-  it did not choose.
-- **It costs `[io]` for a string the program already has.**  Reading
-  the environment is `[io]` under SPEC § 5.1, so the label would land
-  on every caller — including the ones passing a literal in a test.
-- **It is process-global state a test cannot set per case.**  Two tests
-  against two fake providers in one process cannot both have
-  `OPENAI_API_KEY`.
-
-So the caller reads it, and spends its own `[io]`:
-
-```novo ignore
-let p = llmcreq.openai(env.get("OPENAI_API_KEY") ?? "")
-```
-
-The variable names the providers document are `OPENAI_API_KEY`,
-`ANTHROPIC_API_KEY` and `GROQ_API_KEY`, and that sentence is the whole
-of this package's involvement with them.  `llmcreq.redacted` is
-published beside the value because the second thing that happens to a
-provider is that somebody prints it.
-
-## Two dialects, one client
-
-`LlmcDialect` is a **value**, not a type parameter.  A program that
-read its provider out of a configuration file has a `Str` at run time,
-and a type parameter would have made it write every call twice under a
-`match`.
-
-What the two dialects do not share, each of which is a 400 or a wrong
-answer for a client that assumed the other:
-
-| | OpenAI chat | Anthropic Messages |
-| --- | --- | --- |
-| system prompt | first message in the array | a top-level field; a `system` role is a 400 |
-| `max_tokens` | optional, has a default | **required**, no default |
-| content | a string, with `tool_calls` beside it | a block list, text and `tool_use` interleaved |
-| a tool result | `role: "tool"` with `tool_call_id` | a `user` message with a `tool_result` block |
-| "must call a tool" | `tool_choice: "required"` | `tool_choice: {"type": "any"}` |
-| JSON with no schema | `response_format: {"type":"json_object"}` | **no spelling at all** |
-| JSON with a schema | `json_schema` with `strict` | one forced tool whose input schema is the shape |
-| a seed | `seed` | **no spelling at all** |
-| usage on a stream | only with `stream_options.include_usage` | always, on `message_delta` |
-| stream frames | unnamed; the discriminator is in the data | named in the `event:` field |
-| "at capacity" | 503 | **529**, which is not a server error |
-
-`llmcreq.check` refuses every request whose difference has no spelling,
-naming both the feature and the dialect, before a byte travels.  A
-client that dropped the request quietly is the failure this exists to
-prevent: a `seed` silently ignored leaves a caller believing a run is
-reproducible, and a `json_object` silently ignored returns prose to a
-caller that will parse it.
-
-## `strict` is a promise, and `validate_format` is the proof
-
-OpenAI's own endpoint constrains decoding to the schema.  Several
-servers that speak the same dialect accept the field and prompt for it
-instead.  The Anthropic dialect has no `response_format` at all, so
-this package obtains the shape there by forcing a single tool whose
-input schema is the shape — which the model can still fill in wrongly.
-
-So schema-nv is a dependency rather than a suggestion:
-`llmcchat.validate_format` answers which instance locations failed, and
-a caller that needs a shape checks rather than trusts.
-
-## The retry knows what the response said
-
-Three things a retry loop over an LLM API has to know, none of which is
-derivable from the status alone:
-
-- **The server usually says how long.**  `Retry-After`, and the
-  provider's own reset headers.  A client using its own exponential
-  backoff either waits four seconds when it was told six — and gets a
-  second 429 — or waits sixty when it was told two.
-- **A 429 is two different limits.**  Requests per minute and *tokens*
-  per minute reset at different times, and one large request can
-  exhaust the token bucket while the request bucket is untouched.
-- **A POST that timed out may have been executed.**  The completion was
-  generated and billed and the reply was lost coming back; the retry
-  produces and bills a second one.  `LlmcRetry.idempotency_key` is a
-  field rather than a convenience, so a loop that retries without one
-  left it empty on purpose.
-
-The jitter takes a **uniform as an argument**, the way hnsw-nv,
-fake-nv and stats-nv take theirs.  rand-nv is `host` and so is this
-package, so the constraint is not a layer rule here — it is a
-reproducibility one: a retry schedule is a pure function of the policy,
-the attempt and the uniform sequence, so `tests/llmcretry_tests.nv`
-asserts numbers instead of ranges.
-
-## Streaming is frames, not a callback
-
-`std.llm.stream` takes a callback, and its own page records the cost:
-on the compiled leg the whole reply arrives in one call, so a program
-written against it is a program whose streaming silently is not.
-
-A callback also decides for the caller where the loop lives, which is
-the one decision a library should not make — a terminal repainting per
-delta, an HTTP server forwarding to its own client and an agent
-counting tokens all want different loops.  So `llmcsse` is feed and
-drain, `LlmcStreamState` is a value the caller threads, and the three
-things a wrong reader gets wrong quietly are each an assertion in
-`tests/llmcsse_tests.nv`:
-
-- **A frame ends at a blank line**, not at a newline; a reader that
-  emitted per line splits one JSON document into pieces.
-- **`data: [DONE]` is not JSON**; a reader that parsed every frame
-  reports a malformed reply at the end of every *successful* stream.
-- **Tool-call arguments arrive split at arbitrary byte boundaries.**
-  There is a point in every tool-calling stream at which the arguments
-  are `{"city": "Cope`.  They accumulate as text and are parsed once,
-  which is also why `LlmcToolCall.arguments` is a `Str`.
-
-And the one that is not quiet: **a stream that ends with no terminal
-event is a truncated reply**, so `llmcsse.finish` answers a `Result`.
-`partial` is the accessor for a caller that wants to show it anyway,
-named so that showing it is a decision.
-
-## The token budget, and what the number is worth
-
-`llmcreq.check_budget` refuses a request locally, before the round
-trip, rather than letting it come back as an opaque 400.  What the
-count is worth depends on the model:
-
-- against a **local** model whose `tokenizer.json` the caller read, it
-  is exact;
-- against a **hosted** model it is an estimate, because the provider's
-  tokenizer is not published.
-
-`LlmcReply.usage` is the truth in both cases, and it arrives after the
-money is spent — which is the whole reason to estimate first.
-`llmcreq.tools_tokens` is published separately because it is the number
-that surprises people: a thirty-tool catalogue is sent on *every* turn
-of an agent loop and is usually the largest single part of the request.
-novoagent's own context manager records the same discovery from the
-other side — its 33-tool catalogue pins 17 KB of a 40,000-character
-budget.
-
-## What this package does not do
-
-- **No `llm-codec-nv` row is asked for.**  The two dialect modules are
-  `core`-shaped and `[]` throughout, so the rule is kept without the
-  package; they lift out unchanged if a server, a proxy or a recorder
-  ever wants them.  A package whose README said "this builds a chat
-  request body" is not one anybody browses to.
-- **No embeddings.**  `/v1/embeddings` is a different request with a
-  different reply and belongs beside embeddings-nv's arithmetic, not
-  behind a chat client's retry policy.  A row for it does not exist on
-  the grid; this lane's report asks for one.
-- **No multimodal content.**  prompt-nv's `PromptMessage` is text plus
-  a role, and that package's own note says a multimodal row is what the
-  grid needs.  This package would take it the day it exists.
-- **No provider registry.**  There is no table of model names and
-  context windows here, because such a table is wrong within a month
-  and a client that shipped one would be refusing models that exist.
-  `check_budget` takes the limit as an argument for the same reason.
-- **No sleep outside `send_retrying`.**  Every delay is a number
+- **Embeddings.** `/v1/embeddings` is a different request with a different
+  reply. [embeddings-nv](https://novo-lang.org/packages/embeddings-nv) is
+  where that arithmetic lives, and no client for it exists yet.
+- **Images, audio and other non-text content.** A `PromptMessage` is text
+  and a role. This package will carry more when prompt-nv does.
+- **A model registry.** See rule 20.
+- **A sleep outside `send_retrying`.** Every delay is a number
   `llmcretry` computes and the caller waits for.
+- **Local inference.** This package talks to a server over a socket.
+  [ollama-nv](https://novo-lang.org/packages/ollama-nv) talks to a local
+  Ollama server, and `std.llm` runs a model through the toolchain's own
+  path.
+- **A microcontroller build.** The package is `host`: it has a transport in
+  it.
 
-## Dependencies
+## Related packages
 
-Four, all `core`:
+- [prompt-nv](https://novo-lang.org/packages/prompt-nv) owns the
+  conversation: messages, roles, templates, few-shot examples and the token
+  budget. This package renders that conversation into each dialect rather
+  than declaring a second message type.
+- [schema-nv](https://novo-lang.org/packages/schema-nv) compiles and checks
+  JSON Schema. It is what says a response format is a schema before it is
+  sent, and what checks the model's answer against it afterwards.
+- [tokenizers-nv](https://novo-lang.org/packages/tokenizers-nv) provides
+  the token count behind `check_budget`.
+- [http-codec-nv](https://novo-lang.org/packages/http-codec-nv) frames
+  HTTP/1.1. It is what keeps `LlmcTlsHttp` at `[net]`.
+- [ollama-nv](https://novo-lang.org/packages/ollama-nv) speaks to a local
+  Ollama server, which has its own API, its own streaming shape and no API
+  key.
+- [agent-proto-nv](https://novo-lang.org/packages/agent-proto-nv) is the
+  Model Context Protocol: what a tool server offers. This package is how a
+  model is asked what to do with it.
+- `std.llm` in the standard library is the one-line ask:
+  `LlmClient.open(id).ask(q)`, with the key read from the environment and
+  the transport behind an FFI boundary. It costs `[io, ai]`, answers
+  `?Str`, keeps its last error process-wide, has no tool calling, and
+  cannot tell a truncated reply from a whole one. It is the right thing for
+  a script. A program moves to this package when it needs the conversation
+  in its own hands, needs to know why one call failed while another is in
+  flight, needs tool calling, or needs to know that a reply was cut off.
+- `std.json` is the document type both dialects encode into.
 
-- **prompt-nv** — `PromptConvo`, `PromptMessage` and `PromptRole`.  The
-  project's chat message list, which `std.llm` does not have; this
-  package renders it into each dialect rather than declaring a second
-  one.
-- **schema-nv** — compiled JSON Schema, for the structured-output
-  request and for `validate_format`'s proof.
-- **tokenizers-nv** — the token count behind `check_budget`.
-- **http-codec-nv** — HTTP/1.1 framing, which is what keeps
-  `LlmcTlsHttp` at `[net]`.
+## Tests
+
+```bash
+novo test tests/llmcvalue_tests.nv    # 27 tests: providers, requests, replies, faults
+novo test tests/llmcwire_tests.nv     # 14 tests: the two dialects' bodies and errors
+novo test tests/llmcchat_tests.nv     # 14 tests: the client, the checks and the session
+novo test tests/llmcreply_tests.nv    # 11 tests: how a reply ended and what it owes
+novo test tests/llmcretry_tests.nv    # 14 tests: the headers, the backoff and the key
+novo test tests/llmcsse_tests.nv      # 10 tests: framing, `[DONE]`, and split arguments
+```
+
+The request bodies and the reply shapes are the two published API
+references. The stream framing is the HTML Living Standard's server-sent
+events section. The retry headers are `Retry-After` and the providers'
+documented reset headers.
+
+The suite asserts the three quiet mistakes a stream reader makes: a frame
+that ends at a newline rather than a blank line, `[DONE]` parsed as JSON,
+and tool-call arguments parsed before they are whole. Because the jitter
+takes its uniforms as arguments, `llmcretry_tests.nv` asserts exact delays
+rather than ranges.
+
+The tests compile today and fail at run, each on the
+`not implemented: llm-client-nv.<module>.<fn>` panic that is its body. That
+is the expected state of an interface release. They turn green one at a
+time as bodies land.
+
+## Implementation status
+
+| Item | Implemented |
+| --- | --- |
+| `llmcreq.dialect_name`, `.dialect_of_name` | no |
+| `llmcreq.openai`, `.anthropic`, `.compatible`, `.with_base_url`, `.with_header`, `.with_api_version` | no |
+| `llmcreq.provider_base_url`, `.key_is_set`, `.redacted`, `.chat_path`, `.auth_headers` | no |
+| `llmcreq.tool`, `.params`, `.with_max_tokens`, `.with_temperature`, `.with_top_p`, `.with_stop`, `.with_seed` | no |
+| `llmcreq.request`, `.with_tools`, `.with_tool_choice`, `.with_format`, `.with_params`, `.streaming` | no |
+| `llmcreq.check`, `.is_tool_name` | no |
+| `llmcreq.request_tokens`, `.tools_tokens`, `.check_budget` | no |
+| `llmcreply.is_complete`, `.stop_note`, `.stop_of_openai`, `.stop_of_anthropic` | no |
+| `llmcreply.arguments_json`, `.no_usage`, `.total_tokens`, `.add_usage`, `.empty_reply` | no |
+| `llmcreply.owed_tool_results`, `.unanswered`, `.call_by_id`, `.wants_tools`, `.is_truncated`, `.json_of` | no |
+| `llmcreply.to_message`, `.to_messages` | no |
+| `llmcopenai`'s three constants | yes (they are constants) |
+| `llmcopenai.encode_request`, `.encode_body`, `.encode_message`, `.encode_messages` | no |
+| `llmcopenai.encode_tool`, `.encode_tool_choice`, `.encode_format`, `.assistant_turn`, `.tool_result_message` | no |
+| `llmcopenai.decode_reply`, `.decode_value`, `.decode_usage`, `.decode_error`, `.events_of_frame`, `.is_model_name` | no |
+| `llmcanthro`'s three constants | yes (they are constants) |
+| `llmcanthro.encode_request`, `.encode_body`, `.encode_system`, `.encode_messages`, `.encode_message` | no |
+| `llmcanthro.encode_tool`, `.encode_tool_choice`, `.encode_format`, `.assistant_turn`, `.tool_result_message` | no |
+| `llmcanthro.decode_reply`, `.decode_value`, `.blocks_of`, `.decode_usage`, `.decode_error`, `.events_of_frame`, `.is_model_name` | no |
+| `llmcsse.reader`, `.reader_with`, `.feed`, `.take`, `.pending_len`, `.is_done` | no |
+| `llmcsse.stream`, `.apply`, `.apply_all`, `.finished`, `.partial`, `.finish`, `.text_delta` | no |
+| `llmcretry.retry`, `.no_retry`, `.with_max_attempts`, `.with_base_delay_ms`, `.with_max_delay_ms`, `.with_idempotency_key` | no |
+| `llmcretry.no_limits`, `.limits_of`, `.parse_duration_ms`, `.retry_after_from` | no |
+| `llmcretry.should_retry`, `.next_delay_ms`, `.schedule`, `.idempotency_headers` | no |
+| `llmcretry.now_ms`, `.elapsed_ms`, `.deadline_passed` | no |
+| `llmchttp.std_http`, `.dial_tls`, `.origin_of`, `.header_of`, `.is_event_stream` | no |
+| `LlmcTransport` for `LlmcStdHttp` and for `LlmcTlsHttp`: all four methods | no |
+| `llmcchat.client`, `.with_retry`, `.with_deadline_ms`, `.describe` | no |
+| `llmcchat.encode`, `.headers_for`, `.decode`, `.decode_frame` | no |
+| `llmcchat.send`, `.send_retrying`, `.stream_open`, `.stream_next` | no |
+| `llmcchat.validate_format`, `.append_reply`, `.append_tool_result` | no |
+| `llmcfault.is_retryable`, `.is_caller_error`, `.status_of`, `.of_status`, `.with_retry_after`, `LlmcFault.message` | no |
 
 ## Licence
 
-Apache-2.0.
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->

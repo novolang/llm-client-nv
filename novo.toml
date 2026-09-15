@@ -1,6 +1,6 @@
 [package]
 name        = "llm-client-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "One client for the hosted chat APIs: the OpenAI-compatible chat dialect and Anthropic's Messages dialect as sans-IO codec modules over the standard library's JSON value, prompt-nv's conversation as the input, tool calls and tool results as values, structured output through schema-nv, streaming as SSE frames a caller drains, retries with backoff and the rate-limit headers, and a token budget through tokenizers-nv.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
