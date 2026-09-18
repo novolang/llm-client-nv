@@ -53,7 +53,7 @@ prompt-nv = "^0.0.1"
 # than a location.  `schvalidate.validate` is also how a caller checks
 # the model's answer against the schema it asked for, which matters
 # because "strict" is a provider's promise and not a proof.
-schema-nv = "^0.0.1"
+schema-nv = "^0.0.2"
 
 # The token budget.  `tokmodel.encode` is the count, and the README
 # says exactly what that count is worth against a hosted model whose

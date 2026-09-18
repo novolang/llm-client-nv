@@ -9,6 +9,11 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.
 
+The schema-nv range moves to `^0.0.2`, the version whose `SchFault`
+carries the `impl Error` that `Result<_, scherror.SchFault>` has
+required since SPEC § 3.4.  Nothing in this package's own interface
+changed.
+
 ## 0.0.1 — 2026-09-12
 
 The **interface**: every signature and every effect row, and no bodies.
