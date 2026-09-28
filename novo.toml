@@ -1,6 +1,6 @@
 [package]
 name        = "llm-client-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "One client for the hosted chat APIs: the OpenAI-compatible chat dialect and Anthropic's Messages dialect as sans-IO codec modules over the standard library's JSON value, prompt-nv's conversation as the input, tool calls and tool results as values, structured output through schema-nv, streaming as SSE frames a caller drains, retries with backoff and the rate-limit headers, and a token budget through tokenizers-nv.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -45,7 +45,7 @@ novo        = ">= 0.8.9"
 # defines no chat-message type at all — so this package renders that
 # type into each dialect rather than declaring a second one.  `core`,
 # so `dep-layer` holds.
-prompt-nv = "^0.0.1"
+prompt-nv = "^0.0.2"
 
 # Structured output.  A response format is a JSON Schema document, and
 # `schcompile.compile` is what says the document is a schema before it
@@ -53,16 +53,16 @@ prompt-nv = "^0.0.1"
 # than a location.  `schvalidate.validate` is also how a caller checks
 # the model's answer against the schema it asked for, which matters
 # because "strict" is a provider's promise and not a proof.
-schema-nv = "^0.0.2"
+schema-nv = "^0.1.0"
 
 # The token budget.  `tokmodel.encode` is the count, and the README
 # says exactly what that count is worth against a hosted model whose
 # tokenizer is the provider's.
-tokenizers-nv = "^0.0.1"
+tokenizers-nv = "^0.0.2"
 
 # HTTP/1.1 framing for the narrow transport.  `h1write.request` builds
 # the request bytes and `h1read` drains the response, so a client over
 # `std.tls` alone costs `[net]` and nothing else.  The wide transport
 # over `std.http` costs `[io, net, time, async]`, and the README has
 # the table.
-http-codec-nv = "^0.0.2"
+http-codec-nv = "^0.1.0"

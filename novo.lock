@@ -3,27 +3,27 @@
 [http-codec-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "b5a1cfdaaa2a41fde37848e51508e2e4e2a0d88a221377a22fe01d004b8f44f1"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "4265f9e51f7897955af1809e2ccf5a75f22c217b18f7d77bca9919d5d2a5b45c"
 
 [prompt-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "bf6366dd0f3eaf0b53c8efb42e72c9320fcb6254e61f44f4e0ccb9a61b653283"
+req = "^0.0.2"
+version = "0.0.2"
+hash = "d68bf926ed51256f87b0cd7bbd5a433ff2290e30a93c2b8c32be4fb1f107ffac"
 
 [schema-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "36669b54907dc48a0e4c1d51a59f7b48009702ec00c93ac6bac7de149827dee1"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "fb511ebb5b75f00a200a72ab3fbc11ea72e7c56dbe918adcb9a54065763ba0eb"
 
 [tokenizers-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.1"
-version = "0.0.1"
-hash = "1251f6d85bd8b676cb66a11d51c82cbd239b9282168809d4f63751d3b952e2a2"
+req = "^0.0.2"
+version = "0.0.2"
+hash = "c1471eb68aa5fe9bab91d4622a7692b03247a8bbac3a8679490844e411f97689"

@@ -5,6 +5,22 @@ All notable changes to llm-client-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.0.3 — 2026-09-28
+
+The dependency ranges move to the releases published on 2026-09-28:
+prompt-nv `^0.0.2`, schema-nv `^0.1.0`, tokenizers-nv `^0.0.2` and
+http-codec-nv `^0.1.0`.  Nothing in this package's own interface
+changed.
+
+### Fixed
+
+- `tests/llmcchat_tests.nv`: the scripted transport's `llmc_read`
+  returns `list.clone(self.body)` rather than `self.body`.  A plain
+  return hands the caller a list it may write, and under SPEC § 4.1's
+  reference semantics for lists that list has to be a new value or a
+  copy, not a field of `self` (E2038), so the suite stopped before its
+  first test.
+
 ## 0.0.2 — 2026-09-15
 
 README rewritten to the package README style guide (docs/writing-a-readme.md); no change to the interface.

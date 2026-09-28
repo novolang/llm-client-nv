@@ -52,7 +52,7 @@ impl LlmcTransport[] for LlmcScript
 
     fn llmc_read(self, max: Int) -> Result<[u8], LlmcFault>
         if self.open
-            Ok(self.body)
+            Ok(list.clone(self.body))
         else
             Ok([])
 
