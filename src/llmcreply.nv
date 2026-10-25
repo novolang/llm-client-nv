@@ -41,6 +41,7 @@
 
 use std.list
 use promptmsg
+use llmcfault
 
 // Why a reply ended.
 //

@@ -12,6 +12,7 @@
 use std.test
 use std.list
 use llmcretry
+use llmcfault
 
 @test
 fn test_the_server_beats_the_computed_backoff() [io]

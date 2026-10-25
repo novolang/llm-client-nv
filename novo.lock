@@ -18,8 +18,8 @@ hash = "d68bf926ed51256f87b0cd7bbd5a433ff2290e30a93c2b8c32be4fb1f107ffac"
 source = "registry"
 url = "https://registry.novo-lang.org"
 req = "^0.1.0"
-version = "0.1.0"
-hash = "fb511ebb5b75f00a200a72ab3fbc11ea72e7c56dbe918adcb9a54065763ba0eb"
+version = "0.1.1"
+hash = "004aca32b0b7836108dde2e439500a43adc98764111a999c72cb2e92060b0a99"
 
 [tokenizers-nv]
 source = "registry"

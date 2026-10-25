@@ -37,6 +37,7 @@
 use std.json
 use std.list
 use promptmsg
+use llmcfault
 
 // Which wire dialect a provider speaks.
 //

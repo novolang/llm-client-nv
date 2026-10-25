@@ -37,6 +37,7 @@
 // replace.
 
 use llmcreq
+use llmcfault
 
 // One HTTP response, as much of it as a transport has.
 pub struct LlmcHttpReply

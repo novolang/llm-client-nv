@@ -45,6 +45,8 @@
 // it anyway, named so that showing it is a decision.
 
 use std.bytes
+use llmcfault
+use llmcreply
 
 // One server-sent event, assembled from its lines.
 pub struct LlmcSseFrame

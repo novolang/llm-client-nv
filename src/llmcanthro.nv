@@ -50,6 +50,7 @@ use std.list
 use llmcfault
 use llmcreq
 use llmcreply
+use llmcsse
 
 // Anthropic's own origin.
 pub const LLMC_ANTHROPIC_BASE_URL = "https://api.anthropic.com"

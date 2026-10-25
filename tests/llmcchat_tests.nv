@@ -23,6 +23,7 @@ use llmcreply
 use llmcretry
 use llmcsse
 use promptmsg
+use llmcfault
 
 // A transport over a recorded response.  It performs nothing.
 struct LlmcScript

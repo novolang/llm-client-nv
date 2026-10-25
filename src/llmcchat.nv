@@ -33,6 +33,7 @@ use llmcreply
 use llmcretry
 use llmcsse
 use llmchttp
+use llmcfault
 
 // A configured client: a provider, a retry policy and a deadline.
 //
