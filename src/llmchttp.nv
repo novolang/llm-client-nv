@@ -1,8 +1,6 @@
 // llmchttp.nv — the transport, and the only module in this package
 // that touches a socket.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `LlmcTransport[e]` IS THE TRAIT THAT CROSSES THE LAYER.  Every
 // session call in `llmcchat` is generic over it and declares `[e]`, so
 // a call costs exactly what the caller's transport costs — and a test
@@ -36,6 +34,13 @@
 // compiled leg and is exactly the behaviour this package exists to
 // replace.
 
+use std.bytes
+use std.list
+use std.str
+use std.tls
+use h1msg
+use h1read
+use h1write
 use llmcreq
 use llmcfault
 
@@ -58,19 +63,27 @@ pub struct LlmcHttpReply
 // every call in `llmcchat` costs: `[net]` over TLS, `[io, net, time,
 // async]` over the standard library's HTTP client, and nothing at all
 // over a recorded transcript in a test.
+//
+// Every method takes `var self`.  A streamed exchange has to remember
+// its connection between `llmc_open` and `llmc_read`, and the language
+// refuses a write through a plain `self`; the two shipped transports
+// keep that state in a one-slot list that every copy of the value
+// shares, so a copy made before the call sees what the call stored.
+// A transport that keeps no state ignores the permission.  A caller
+// passes `var t` to the session calls for the same reason.
 pub trait LlmcTransport[e]
     // Send one request and buffer the whole response.
-    fn llmc_exchange(self, method: Str, path: Str, headers: [Str], body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [e]
+    fn llmc_exchange(var self, method: Str, path: Str, headers: [Str], body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [e]
     // Send one request and stop after the head, leaving the body on
     // the wire for `llmc_read`.  What a stream needs, and the reason
     // the trait has four methods rather than one.
-    fn llmc_open(self, method: Str, path: Str, headers: [Str], body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [e]
+    fn llmc_open(var self, method: Str, path: Str, headers: [Str], body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [e]
     // Up to `max` bytes of a body left on the wire.  An EMPTY answer
     // means the peer closed — which, mid-stream, is
     // `LlmcStreamTruncated` and not the end of a reply.
-    fn llmc_read(self, max: Int) -> Result<[u8], LlmcFault> [e]
+    fn llmc_read(var self, max: Int) -> Result<[u8], LlmcFault> [e]
     // Close it.
-    fn llmc_close(self) -> ?LlmcFault [e]
+    fn llmc_close(var self) -> ?LlmcFault [e]
 
 // A transport over the standard library's HTTP client.
 //
@@ -79,6 +92,11 @@ pub trait LlmcTransport[e]
 pub struct LlmcStdHttp
     client: HttpClient
     base_url: Str
+    // The connection a streamed exchange left open, in a one-slot list
+    // that every copy of this value shares: a trait method takes
+    // `self` by value, and a list is the only place the next
+    // `llmc_read` can find what `llmc_open` opened.
+    var live: [LlmcLive]
 
 // A transport over `std.tls` with http-codec-nv doing the framing.
 //
@@ -86,9 +104,39 @@ pub struct LlmcStdHttp
 // answered a 302 is a gateway misconfiguration and this one reports
 // it as the status it is.
 pub struct LlmcTlsHttp
-    conn: Int
     host: Str
     port: Int
+    // The receive deadline in milliseconds, 0 for none.
+    timeout_ms: Int
+    // The current connection and what has been read off it, in a
+    // one-slot list that every copy of this value shares.
+    var wire: [LlmcWire]
+
+// The standard-library connection a streamed exchange is reading.
+pub struct LlmcLive
+    conn: HttpConn
+    reader: HttpReplyReader
+    // Whether the body is chunked.  `HttpReplyReader.read` hands back
+    // the chunk framing as it arrived, so a chunked body is decoded
+    // here, by http-codec-nv's reader.
+    chunked: Bool
+    decoder: H1Reader
+    // The chunked body ended.
+    done: Bool
+
+// A TLS connection, the response reader over it and the body bytes a
+// `llmc_read` has been handed and not yet returned.
+pub struct LlmcWire
+    conn: Int
+    reader: H1Reader
+    // Body bytes the reader produced beyond what the last `llmc_read`
+    // asked for.
+    held: [u8]
+    // The response has ended.
+    done: Bool
+    // An exchange has used this connection.  The request says
+    // `Connection: close`, so the next one dials again.
+    used: Bool
 
 // A standard-library transport for a provider.
 //
@@ -105,7 +153,8 @@ pub struct LlmcTlsHttp
 //         Err(_) => false
 // ```
 pub fn std_http(p: LlmcProvider, timeout_ms: Int) -> Result<LlmcStdHttp, LlmcFault> []
-    todo("llm-client-nv.llmchttp.std_http")
+    let client = HttpClient.new(p.base_url).with_timeout(timeout_ms)
+    Ok(LlmcStdHttp { client: client, base_url: p.base_url, live: [] })
 
 // Dial a provider over TLS.
 //
@@ -120,7 +169,12 @@ pub fn std_http(p: LlmcProvider, timeout_ms: Int) -> Result<LlmcStdHttp, LlmcFau
 //     llmchttp.dial_tls(p, 30000)
 // ```
 pub fn dial_tls(p: LlmcProvider, timeout_ms: Int) -> Result<LlmcTlsHttp, LlmcFault> [net]
-    todo("llm-client-nv.llmchttp.dial_tls")
+    let o = origin_of(p)!
+    if o.scheme != "https"
+        return Err(LlmcUnsupported("the ${o.scheme} scheme", "the TLS transport"))
+    let conn = connect_tls(o.host, o.port, timeout_ms)!
+    Ok(LlmcTlsHttp { host: o.host, port: o.port, timeout_ms: timeout_ms,
+                     wire: [fresh_wire(conn)] })
 
 // The host and port a provider's origin names.
 //
@@ -140,7 +194,51 @@ pub fn dial_tls(p: LlmcProvider, timeout_ms: Int) -> Result<LlmcTlsHttp, LlmcFau
 //     // : 443
 // ```
 pub fn origin_of(p: LlmcProvider) -> Result<LlmcOrigin, LlmcFault> []
-    todo("llm-client-nv.llmchttp.origin_of")
+    let origin = p.base_url
+    var scheme = ""
+    var rest = origin
+    match str.index(origin, "://")
+        Some(at) =>
+            scheme = str.lower(str.slice(origin, 0, at))
+            rest = str.slice(origin, at + 3, str.len(origin))
+        None     =>
+            return Err(LlmcBadEncoding("the origin ${origin} has no scheme://"))
+    if scheme != "http" and scheme != "https"
+        return Err(LlmcUnsupported("the ${scheme} scheme", "the HTTP transports"))
+    match str.index(rest, "/")
+        Some(at) =>
+            rest = str.slice(rest, 0, at)
+        None     => 0
+    var host = rest
+    var port = 80
+    if scheme == "https"
+        port = 443
+    var tail = rest
+    if str.starts_with(rest, "[")
+        match str.index(rest, "]")
+            Some(close) =>
+                host = str.slice(rest, 0, close + 1)
+                tail = str.slice(rest, close + 1, str.len(rest))
+            None        =>
+                return Err(LlmcBadEncoding("the origin ${origin} has an unclosed [ in its host"))
+    else
+        match str.index(rest, ":")
+            Some(at) =>
+                host = str.slice(rest, 0, at)
+                tail = str.slice(rest, at, str.len(rest))
+            None     =>
+                tail = ""
+    if str.starts_with(tail, ":")
+        match str.to_int(str.slice(tail, 1, str.len(tail)))
+            Some(n) =>
+                port = n
+            None    =>
+                return Err(LlmcBadEncoding("the origin ${origin} has a port that is not a number"))
+    elif tail != ""
+        return Err(LlmcBadEncoding("the origin ${origin} has text after its host"))
+    if host == "" or port < 1 or port > 65535
+        return Err(LlmcBadEncoding("the origin ${origin} names no usable host and port"))
+    Ok(LlmcOrigin { scheme: scheme, host: host, port: port })
 
 // A provider's origin, split.
 pub struct LlmcOrigin
@@ -165,7 +263,14 @@ pub struct LlmcOrigin
 //     // : 6
 // ```
 pub fn header_of(headers: [Str], name: Str) -> ?Str []
-    todo("llm-client-nv.llmchttp.header_of")
+    let want = str.lower(name)
+    for line in headers
+        match str.index(line, ":")
+            Some(at) =>
+                if str.lower(str.trim(str.slice(line, 0, at))) == want
+                    return Some(str.trim(str.slice(line, at + 1, str.len(line))))
+            None     => 0
+    None
 
 // Whether a response is a server-sent event stream.
 //
@@ -183,7 +288,9 @@ pub fn header_of(headers: [Str], name: Str) -> ?Str []
 //     // : true
 // ```
 pub fn is_event_stream(headers: [Str]) -> Bool []
-    todo("llm-client-nv.llmchttp.is_event_stream")
+    match header_of(headers, "content-type")
+        Some(v) => str.contains(str.lower(v), "text/event-stream")
+        None    => false
 
 // The standard library's HTTP client as a transport.
 //
@@ -196,23 +303,76 @@ pub fn is_event_stream(headers: [Str]) -> Bool []
 // use llmcchat
 // use llmchttp
 //
-// fn ask(c: LlmcClient, t: LlmcStdHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [io, net, time, async]
-//     llmcchat.send(c, t, r)
+// fn ask(c: LlmcClient, var t: LlmcStdHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [io, net, time, async]
+//     llmcchat.send(c, var t, r)
 // ```
 impl LlmcTransport[io, net, time, async] for LlmcStdHttp
-    fn llmc_exchange(self, method: Str, path: Str, headers: [Str],
+    fn llmc_exchange(var self, method: Str, path: Str, headers: [Str],
                      body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [io, net, time, async]
-        todo("llm-client-nv.llmchttp.LlmcStdHttp.llmc_exchange")
+        var client = self.client
+        for line in headers
+            match str.index(line, ":")
+                Some(at) =>
+                    client = client.with_header(str.trim(str.slice(line, 0, at)),
+                                                str.trim(str.slice(line, at + 1, str.len(line))))
+                None     => 0
+        match client.send(method, path, bytes.from_byte_list(as_ints(body)))
+            Err(e)    => Err(std_fault(e, self.client.timeout_ms))
+            Ok(reply) =>
+                Ok(LlmcHttpReply { status: reply.status, headers: reply.headers,
+                                   body: bytes.to_byte_list(reply.body), streamed: false })
 
-    fn llmc_open(self, method: Str, path: Str, headers: [Str],
+    fn llmc_open(var self, method: Str, path: Str, headers: [Str],
                  body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [io, net, time, async]
-        todo("llm-client-nv.llmchttp.LlmcStdHttp.llmc_open")
+        // workaround(a-method-call-on-a-struct-field-leaks-the-receiver):
+        // `self.client.connect()` leaks the connection it opens.
+        let client = self.client
+        match client.connect()
+            Err(e) => Err(std_fault(e, client.timeout_ms))
+            Ok(k)  =>
+                match k.open(method, path, headers, bytes.from_byte_list(as_ints(body)))
+                    Err(e)    => Err(std_fault(e, client.timeout_ms))
+                    Ok(reply) =>
+                        let primed = chunk_decoder()!
+                        list.push(self.live, LlmcLive { conn: k, reader: k.reader(reply),
+                                                        chunked: reply.chunked,
+                                                        decoder: primed, done: false })
+                        Ok(LlmcHttpReply { status: reply.status, headers: reply.headers,
+                                           body: [], streamed: true })
 
-    fn llmc_read(self, max: Int) -> Result<[u8], LlmcFault> [io, net, time, async]
-        todo("llm-client-nv.llmchttp.LlmcStdHttp.llmc_read")
+    fn llmc_read(var self, max: Int) -> Result<[u8], LlmcFault> [io, net, time, async]
+        if list.len(self.live) == 0
+            return Err(LlmcTransportFailed("llmc_read before llmc_open"))
+        let w = self.live[0]
+        if w.done
+            return Ok([])
+        var decoder = w.decoder
+        // workaround(a-method-call-on-a-struct-field-leaks-the-receiver)
+        let reader = w.reader
+        loop
+            match reader.read(max)
+                Err(e)    =>
+                    return Err(LlmcTransportFailed("reading the body: ${e.message()}"))
+                Ok(chunk) =>
+                    let raw = bytes.to_byte_list(chunk)
+                    if not w.chunked or list.len(raw) == 0
+                        return Ok(raw)
+                    // Decoding only removes bytes, so what comes out is
+                    // never more than the `max` that was read.
+                    let got = decode_chunks(decoder, raw)!
+                    decoder = got.reader
+                    self.live[0] = LlmcLive { conn: w.conn, reader: w.reader, chunked: true,
+                                              decoder: decoder, done: got.done }
+                    if list.len(got.data) > 0 or got.done
+                        return Ok(got.data[:])
 
-    fn llmc_close(self) -> ?LlmcFault [io, net, time, async]
-        todo("llm-client-nv.llmchttp.LlmcStdHttp.llmc_close")
+    fn llmc_close(var self) -> ?LlmcFault [io, net, time, async]
+        if list.len(self.live) == 0
+            return None
+        // workaround(a-method-call-on-a-struct-field-leaks-the-receiver)
+        let k = self.live[0].conn
+        k.close()
+        None
 
 // TLS plus http-codec-nv as a transport.
 //
@@ -224,20 +384,232 @@ impl LlmcTransport[io, net, time, async] for LlmcStdHttp
 // use llmcchat
 // use llmchttp
 //
-// fn ask(c: LlmcClient, t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net]
-//     llmcchat.send(c, t, r)
+// fn ask(c: LlmcClient, var t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net]
+//     llmcchat.send(c, var t, r)
 // ```
 impl LlmcTransport[net] for LlmcTlsHttp
-    fn llmc_exchange(self, method: Str, path: Str, headers: [Str],
+    fn llmc_exchange(var self, method: Str, path: Str, headers: [Str],
                      body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [net]
-        todo("llm-client-nv.llmchttp.LlmcTlsHttp.llmc_exchange")
+        let conn = reconnect(var self)!
+        send_request(conn, self.host, method, path, headers, body)!
+        var rd = h1read.expect(h1read.reader(ReadsResponses, h1read.default_limits()),
+                               method_of(method))
+        var status = 0
+        var reply_headers: [Str] = []
+        var out: [u8] = []
+        loop
+            let got = next_event(conn, rd, self.timeout_ms)!
+            rd = got.reader
+            match got.event
+                ResponseHead(resp) =>
+                    status = resp.status
+                    reply_headers = header_lines(resp.headers)
+                BodyBytes(data)    =>
+                    for b in data
+                        list.push(out, b)
+                MessageDone        =>
+                    if status >= 200
+                        return Ok(LlmcHttpReply { status: status, headers: reply_headers,
+                                                  body: out, streamed: false })
+                _                  => 0
 
-    fn llmc_open(self, method: Str, path: Str, headers: [Str],
+    fn llmc_open(var self, method: Str, path: Str, headers: [Str],
                  body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [net]
-        todo("llm-client-nv.llmchttp.LlmcTlsHttp.llmc_open")
+        let conn = reconnect(var self)!
+        send_request(conn, self.host, method, path, headers, body)!
+        var rd = h1read.expect(h1read.reader(ReadsResponses, h1read.default_limits()),
+                               method_of(method))
+        loop
+            let got = next_event(conn, rd, self.timeout_ms)!
+            rd = got.reader
+            match got.event
+                ResponseHead(resp) =>
+                    if resp.status >= 200
+                        self.wire[0] = LlmcWire { conn: conn, reader: rd, held: [],
+                                                  done: false, used: true }
+                        return Ok(LlmcHttpReply { status: resp.status,
+                                                  headers: header_lines(resp.headers),
+                                                  body: [], streamed: true })
+                _                  => 0
 
-    fn llmc_read(self, max: Int) -> Result<[u8], LlmcFault> [net]
-        todo("llm-client-nv.llmchttp.LlmcTlsHttp.llmc_read")
+    fn llmc_read(var self, max: Int) -> Result<[u8], LlmcFault> [net]
+        let w = self.wire[0]
+        if list.len(w.held) > 0
+            return Ok(hand_out(var self, w, w.held, max))
+        if w.done
+            return Ok([])
+        var rd = w.reader
+        loop
+            let got = next_event(w.conn, rd, self.timeout_ms)!
+            rd = got.reader
+            match got.event
+                BodyBytes(data) =>
+                    return Ok(hand_out(var self, wire_at(w, rd, false), data, max))
+                MessageDone     =>
+                    self.wire[0] = wire_at(w, rd, true)
+                    return Ok([])
+                _               => 0
 
-    fn llmc_close(self) -> ?LlmcFault [net]
-        todo("llm-client-nv.llmchttp.LlmcTlsHttp.llmc_close")
+    fn llmc_close(var self) -> ?LlmcFault [net]
+        tls.close(self.wire[0].conn)
+        None
+
+// A byte list widened to the `[Int]` that `bytes.from_byte_list` takes.
+fn as_ints(body: [u8]) -> [Int]
+    var out: [Int] = []
+    for b in body
+        list.push(out, b)
+    out
+
+// A standard-library client error as the fault it is.
+fn std_fault(e: HttpError, timeout_ms: Int) -> LlmcFault
+    match e
+        HttpIo(IoTimedOut) => LlmcTimedOut(timeout_ms)
+        _                  => LlmcTransportFailed(http.client.error_text(e))
+
+// The reader's three words for a request method.
+fn method_of(token: Str) -> H1Method
+    h1msg.method_of(token) ?? ExtensionMethod(token)
+
+// A header section as `Name: value` lines.
+fn header_lines(h: H1Headers) -> [Str]
+    var out: [Str] = []
+    for f in h1msg.fields_of(h)
+        list.push(out, "${f.name}: ${f.value}")
+    out
+
+// A wire that has not carried an exchange yet.
+fn fresh_wire(conn: Int) -> LlmcWire
+    LlmcWire { conn: conn, reader: h1read.reader(ReadsResponses, h1read.default_limits()),
+               held: [], done: false, used: false }
+
+// The same wire with a reader in a new position.
+fn wire_at(w: LlmcWire, rd: H1Reader, done: Bool) -> LlmcWire
+    LlmcWire { conn: w.conn, reader: rd, held: w.held, done: done, used: w.used }
+
+// Open a TLS connection to a host, verifying its certificate.
+fn connect_tls(host: Str, port: Int, timeout_ms: Int) -> Result<Int, LlmcFault> [net]
+    match tls.connect(host, port, tls.config_for_client(host))
+        None       =>
+            Err(LlmcTransportFailed("TLS to ${host}:${port}: ${tls.last_error()}"))
+        Some(conn) =>
+            if timeout_ms > 0
+                tls.set_recv_timeout(conn, timeout_ms)
+            Ok(conn)
+
+// The connection this exchange may use: the one dialled, or, when an
+// earlier exchange has used it, a new one.
+fn reconnect(var t: LlmcTlsHttp) -> Result<Int, LlmcFault> [net]
+    let w = t.wire[0]
+    if not w.used
+        t.wire[0] = LlmcWire { conn: w.conn, reader: w.reader, held: [], done: false, used: true }
+        return Ok(w.conn)
+    tls.close(w.conn)
+    let conn = connect_tls(t.host, t.port, t.timeout_ms)!
+    t.wire[0] = LlmcWire { conn: conn, reader: w.reader, held: [], done: false, used: true }
+    Ok(conn)
+
+// Frame a request and write it.
+fn send_request(conn: Int, host: Str, method: Str, path: Str, headers: [Str],
+                body: [u8]) -> Result<Int, LlmcFault> [net]
+    var fields: [H1Header] = [H1Header { name: "Host", value: host },
+                              H1Header { name: "Connection", value: "close" }]
+    for line in headers
+        match str.index(line, ":")
+            Some(at) =>
+                list.push(fields, H1Header { name: str.trim(str.slice(line, 0, at)),
+                                             value: str.trim(str.slice(line, at + 1, str.len(line))) })
+            None     => 0
+    let req = H1Request { method: method_of(method), target: path, version: Http11,
+                          headers: h1msg.headers(fields) }
+    match h1write.request(req, body)
+        Err(e)    => Err(LlmcBadEncoding(e.message()))
+        Ok(frame) =>
+            if tls.send(conn, bytes.from_byte_list(as_ints(frame)))
+                Ok(list.len(frame))
+            else
+                Err(LlmcTransportFailed("sending the request: ${tls.last_error()}"))
+
+// The reader after one event, and the event.
+struct LlmcWireEvent
+    reader: H1Reader
+    event: H1Event
+
+// The next event of the response, reading the connection when the
+// reader holds only part of one.
+fn next_event(conn: Int, rd: H1Reader, timeout_ms: Int) -> Result<LlmcWireEvent, LlmcFault> [net]
+    var step = decoded(h1read.take(rd))!
+    loop
+        match step.event
+            Some(ev) =>
+                return Ok(LlmcWireEvent { reader: step.reader, event: ev })
+            None     => 0
+        if step.reader.closed
+            return Err(LlmcTransportFailed("the connection closed before the response ended"))
+        match tls.recv(conn, 65536)
+            Some(chunk) =>
+                step = decoded(h1read.feed(step.reader, bytes.to_byte_list(chunk)))!
+            None        =>
+                let why = tls.last_error()
+                // workaround(tls-recv-cannot-tell-a-receive-deadline-from-an-abrupt-close):
+                // an empty read is a close when the detail says the peer
+                // ended, and a receive deadline otherwise.
+                if why != "" and not str.contains(why, "eof") and not str.contains(why, "peer closed")
+                    return Err(LlmcTimedOut(timeout_ms))
+                step = decoded(h1read.finish(step.reader))!
+
+// A reader's step, or the decode error as a fault.
+fn decoded(r: Result<H1Step, H1DecodeError>) -> Result<H1Step, LlmcFault>
+    match r
+        Ok(step) => Ok(step)
+        Err(e)   =>
+            match e
+                MessageTruncated(_) =>
+                    Err(LlmcTransportFailed("the connection closed before the response ended"))
+                _                   => Err(LlmcMalformedReply("an HTTP response: ${e.message()}"))
+
+// Up to `max` of `data` to the caller, the rest kept on the wire.
+fn hand_out(var t: LlmcTlsHttp, w: LlmcWire, data: [u8], max: Int) -> [u8]
+    if list.len(data) <= max
+        t.wire[0] = LlmcWire { conn: w.conn, reader: w.reader, held: [], done: w.done, used: w.used }
+        return data[:]
+    t.wire[0] = LlmcWire { conn: w.conn, reader: w.reader, held: data[max:], done: w.done, used: w.used }
+    data[0:max]
+
+// A response reader primed with a chunked 200 head, so that body bytes
+// fed to it come out with the chunk framing removed.
+//
+// workaround(http-reply-reader-read-hands-back-the-chunk-framing-of-a-chunked-body): the
+// standard library's `HttpReplyReader.read` hands back a chunked body
+// with its size lines in it.  Drop this and read directly when that is
+// fixed.
+fn chunk_decoder() -> Result<H1Reader, LlmcFault>
+    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+    let fresh = h1read.expect(h1read.reader(ReadsResponses, h1read.default_limits()), Post)
+    Ok(decoded(h1read.feed(fresh, bytes.to_byte_list(bytes.from_str(head))))!.reader)
+
+// What a decoder produced from some raw bytes.
+struct LlmcDecoded
+    reader: H1Reader
+    data: [u8]
+    done: Bool
+
+// Feed raw body bytes to a chunk decoder and collect what it releases.
+fn decode_chunks(rd: H1Reader, raw: [u8]) -> Result<LlmcDecoded, LlmcFault>
+    var cur = rd
+    var data: [u8] = []
+    var done = false
+    var step = decoded(h1read.feed(cur, raw))!
+    loop
+        cur = step.reader
+        match step.event
+            Some(BodyBytes(d)) =>
+                for b in d
+                    list.push(data, b)
+            Some(MessageDone)  =>
+                done = true
+            Some(_)            => 0
+            None               =>
+                break
+        step = decoded(h1read.take(cur))!
+    Ok(LlmcDecoded { reader: cur, data: data, done: done })

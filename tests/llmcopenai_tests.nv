@@ -1,0 +1,286 @@
+// llmcopenai_tests.nv — the OpenAI-compatible dialect against the wire
+// shapes OpenAI documents for the Chat Completions API.
+//
+// WHERE THE EXPECTED JSON COMES FROM.  Each literal is written out by
+// hand from the examples in OpenAI's API reference (create chat
+// completion, function calling, structured outputs, streaming), not
+// produced by this package, and compared with `json.equals` so that
+// member order, which JSON does not define, is not asserted.
+
+use std.test
+use std.json
+use std.list
+use std.str
+use llmcopenai
+use llmcreq
+use llmcreply
+use llmcsse
+use llmcfault
+use promptmsg
+
+fn same(v: JsonValueH, expected: Str) -> Bool
+    match json.parse(expected)
+        Some(e) => json.equals(v, e)
+        None    => false
+
+fn hello() -> PromptConvo
+    promptmsg.convo([promptmsg.system_message("You are a helpful assistant."),
+                     promptmsg.user("Hello!")])
+
+fn weather_tool() -> LlmcToolDef
+    match json.parse("{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}")
+        Some(schema) => llmcreq.tool("get_current_weather", "Get the current weather in a given location", schema)
+        None         => llmcreq.tool("get_current_weather", "", json.object([]))
+
+fn encoded(r: LlmcRequest) -> JsonValueH
+    match llmcopenai.encode_request(llmcreq.openai("sk-test"), r)
+        Ok(v)  => v
+        Err(f) => json.string(f.message())
+
+@test
+fn test_the_documented_minimal_request() [io]
+    let r = llmcreq.request("gpt-4o-mini", hello())
+    test.assert(same(encoded(r),
+        "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a helpful assistant.\"},{\"role\":\"user\",\"content\":\"Hello!\"}]}"))
+    match llmcopenai.encode_body(llmcreq.openai("sk-test"), r)
+        Ok(s)  => test.assert(s == json.stringify(encoded(r)))
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_every_sampling_parameter_and_streaming_have_their_documented_spelling() [io]
+    let p = llmcreq.with_seed(llmcreq.with_stop(llmcreq.with_top_p(llmcreq.with_temperature(
+                llmcreq.with_max_tokens(llmcreq.params(), 256), 0.2),
+                0.9),
+                ["END"]),
+                7)
+    let r = llmcreq.streaming(llmcreq.with_params(llmcreq.request("gpt-4o-mini", hello()), p))
+    test.assert(same(encoded(r),
+        "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a helpful assistant.\"},{\"role\":\"user\",\"content\":\"Hello!\"}],\"max_tokens\":256,\"temperature\":0.2,\"top_p\":0.9,\"stop\":[\"END\"],\"seed\":7,\"stream\":true,\"stream_options\":{\"include_usage\":true}}"))
+
+@test
+fn test_tools_choices_and_formats() [io]
+    let tools = llmcreq.with_tools(llmcreq.request("gpt-4o-mini", hello()), [weather_tool()])
+    test.case("a tool set with the default choice sends no tool_choice")
+    test.assert(same(encoded(tools),
+        "{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"system\",\"content\":\"You are a helpful assistant.\"},{\"role\":\"user\",\"content\":\"Hello!\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\",\"description\":\"Get the current weather in a given location\",\"parameters\":{\"type\":\"object\",\"properties\":{\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}}}]}"))
+
+    test.case("a named choice is the documented object")
+    let named = llmcreq.with_tool_choice(tools, LlmcToolNamed("get_current_weather"))
+    match json.get(encoded(named), "tool_choice")
+        Some(c) => test.assert(same(c, "{\"type\":\"function\",\"function\":{\"name\":\"get_current_weather\"}}"))
+        None    => test.fail("no tool_choice")
+
+    test.case("none and required are bare strings")
+    test.assert(same(llmcopenai.encode_tool_choice(LlmcToolNone), "\"none\""))
+    test.assert(same(llmcopenai.encode_tool_choice(LlmcToolRequired), "\"required\""))
+    test.assert(same(llmcopenai.encode_tool_choice(LlmcToolAuto), "\"auto\""))
+
+    test.case("the three response formats")
+    match llmcopenai.encode_format(LlmcFormatText)
+        Ok(v)  => test.assert(same(v, "{\"type\":\"text\"}"))
+        Err(f) => test.fail(f.message())
+    let schema = json.object([("type", json.string("object"))])
+    let shaped = llmcreq.with_format(llmcreq.request("gpt-4o-mini", hello()),
+                                     LlmcFormatSchema("answer", schema, true))
+    match json.get(encoded(shaped), "response_format")
+        Some(f) => test.assert(same(f,
+            "{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"answer\",\"schema\":{\"type\":\"object\"},\"strict\":true}}"))
+        None    => test.fail("no response_format")
+    let plain_json = llmcreq.with_format(llmcreq.request("gpt-4o-mini", hello()), LlmcFormatJson)
+    match json.get(encoded(plain_json), "response_format")
+        Some(f) => test.assert(same(f, "{\"type\":\"json_object\"}"))
+        None    => test.fail("no response_format")
+
+fn calls_convo() -> PromptConvo
+    promptmsg.convo([promptmsg.user("weather in two cities?"),
+                     promptmsg.assistant("let me look"),
+                     PromptMessage { role: PromptAssistant, text: "{\"city\":\"Copenhagen\"}",
+                                     name: "get_weather", call_id: "call_a" },
+                     PromptMessage { role: PromptAssistant, text: "{\"city\":\"Oslo\"}",
+                                     name: "get_weather", call_id: "call_b" },
+                     promptmsg.tool_result("get_weather", "call_a", "12 C"),
+                     promptmsg.tool_result("get_weather", "call_b", "8 C")])
+
+@test
+fn test_a_turn_with_two_calls_is_one_assistant_message_and_two_tool_messages() [io]
+    match llmcopenai.encode_messages(calls_convo())
+        Err(f) => test.fail(f.message())
+        Ok(v)  =>
+            test.assert(same(v,
+                "[{\"role\":\"user\",\"content\":\"weather in two cities?\"},{\"role\":\"assistant\",\"content\":\"let me look\",\"tool_calls\":[{\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Copenhagen\\\"}\"}},{\"id\":\"call_b\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"{\\\"city\\\":\\\"Oslo\\\"}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"call_a\",\"content\":\"12 C\"},{\"role\":\"tool\",\"tool_call_id\":\"call_b\",\"content\":\"8 C\"}]"))
+
+    test.case("a call with no text before it has null content, and empty arguments become {}")
+    let bare = promptmsg.convo([promptmsg.user("x"),
+                                PromptMessage { role: PromptAssistant, text: "", name: "now", call_id: "c1" },
+                                promptmsg.tool_result("now", "c1", "noon")])
+    match llmcopenai.encode_messages(bare)
+        Err(f) => test.fail(f.message())
+        Ok(v)  => test.assert(same(v,
+            "[{\"role\":\"user\",\"content\":\"x\"},{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"{}\"}}]},{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"noon\"}]"))
+
+    test.case("a call after a user message does not borrow its text")
+    let odd = promptmsg.convo([promptmsg.user("x"),
+                               PromptMessage { role: PromptAssistant, text: "{}", name: "now", call_id: "c1" }])
+    match llmcopenai.encode_messages(odd)
+        Err(f) => test.fail(f.message())
+        Ok(v)  => test.assert(json.len(v) == Some(2))
+
+    test.case("a lone call message and a tool message with no id")
+    match llmcopenai.encode_message(PromptMessage { role: PromptAssistant, text: "{}", name: "now", call_id: "c1" })
+        Ok(v)  => test.assert(json.type_of(v) == "object")
+        Err(f) => test.fail(f.message())
+    match llmcopenai.encode_message(promptmsg.tool_result("now", "", "noon"))
+        Ok(_)  => test.fail("a result with no id encoded")
+        Err(f) => test.assert_eq_str(f.message(), "the request cannot be encoded: a tool result names no call id")
+    match llmcopenai.encode_messages(promptmsg.convo([promptmsg.user("x"), promptmsg.assistant(""),
+                                                      promptmsg.tool_result("now", "", "noon")]))
+        Ok(_)  => test.fail("a result with no id encoded")
+        Err(_) => test.assert(true)
+
+    test.case("the lossless turn")
+    let reply = LlmcReply { stop: LlmcStopToolUse, text: "", usage: llmcreply.no_usage(), model: "", id: "",
+                            tool_calls: [LlmcToolCall { id: "c1", name: "now", arguments: "{}" }] }
+    test.assert(same(llmcopenai.assistant_turn(reply),
+        "{\"role\":\"assistant\",\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"now\",\"arguments\":\"{}\"}}]}"))
+    test.assert(same(llmcopenai.assistant_turn(llmcreply.empty_reply()),
+        "{\"role\":\"assistant\",\"content\":null}"))
+
+@test
+fn test_the_documented_response_decodes() [io]
+    let body = "{\"id\":\"chatcmpl-abc123\",\"object\":\"chat.completion\",\"created\":1677858242,\"model\":\"gpt-4o-mini-2024-07-18\",\"usage\":{\"prompt_tokens\":13,\"completion_tokens\":7,\"total_tokens\":20,\"prompt_tokens_details\":{\"cached_tokens\":4},\"completion_tokens_details\":{\"reasoning_tokens\":3}},\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"\\n\\nThis is a test!\"},\"logprobs\":null,\"finish_reason\":\"stop\",\"index\":0}]}"
+    match llmcopenai.decode_reply(body)
+        Err(f) => test.fail(f.message())
+        Ok(r)  =>
+            test.assert(r.text == "\n\nThis is a test!")
+            test.assert(r.id == "chatcmpl-abc123")
+            test.assert(r.usage.input_tokens == 13)
+            test.assert(r.usage.output_tokens == 7)
+            test.assert(r.usage.cached_input_tokens == 4)
+            test.assert(r.usage.reasoning_tokens == 3)
+            test.assert(llmcreply.is_complete(r.stop))
+    test.case("a server that sends stop beside tool calls still owes the results")
+    let odd = "{\"choices\":[{\"message\":{\"content\":null,\"tool_calls\":[{\"id\":\"c1\",\"function\":{\"name\":\"now\",\"arguments\":{\"tz\":\"UTC\"}}},{\"id\":\"c2\",\"function\":{\"name\":\"later\"}}]},\"finish_reason\":\"stop\"}]}"
+    match llmcopenai.decode_reply(odd)
+        Err(f) => test.fail(f.message())
+        Ok(r)  =>
+            test.assert(llmcreply.wants_tools(r))
+            test.assert(list.len(llmcreply.owed_tool_results(r)) == 2)
+            test.assert(r.tool_calls[0].arguments == "{\"tz\":\"UTC\"}")
+            test.assert(r.tool_calls[1].arguments == "")
+    test.case("arguments that are null are empty text")
+    match llmcopenai.decode_reply("{\"choices\":[{\"message\":{\"tool_calls\":[{\"id\":\"c\",\"function\":{\"name\":\"n\",\"arguments\":null}}]},\"finish_reason\":\"tool_calls\"}]}")
+        Ok(r)  => test.assert(r.tool_calls[0].arguments == "")
+        Err(f) => test.fail(f.message())
+    test.case("a body that is not JSON, and a choice with no message")
+    match llmcopenai.decode_reply("<html>")
+        Ok(_)  => test.fail("html decoded")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no body as JSON")
+    match llmcopenai.decode_reply("{\"choices\":[{\"finish_reason\":\"stop\"}]}")
+        Ok(_)  => test.fail("a choice with no message decoded")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no choices[0].message")
+    match llmcopenai.decode_reply("{\"choices\":[{\"message\":{\"content\":\"x\"}}]}")
+        Ok(r)  => test.assert(not llmcreply.is_complete(r.stop))
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_documented_errors_become_the_right_faults() [io]
+    test.case("OpenAI's own error object")
+    let bad_key = "{\"error\":{\"message\":\"Incorrect API key provided: sk-xxx.\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"invalid_api_key\"}}"
+    test.assert_eq_str(llmcopenai.decode_error(401, bad_key).message(),
+        "401 the key was refused: Incorrect API key provided: sk-xxx.")
+    let too_long = "{\"error\":{\"message\":\"maximum context length\",\"type\":\"invalid_request_error\",\"param\":\"messages\",\"code\":\"context_length_exceeded\"}}"
+    test.assert_eq_str(llmcopenai.decode_error(400, too_long).message(),
+        "400 context_length_exceeded: maximum context length")
+    test.case("the type stands in for a missing code")
+    test.assert_eq_str(llmcopenai.decode_error(400, "{\"error\":{\"message\":\"m\",\"type\":\"invalid_request_error\"}}").message(),
+        "400 invalid_request_error: m")
+    test.case("a gateway's text, and an empty body")
+    test.assert_eq_str(llmcopenai.decode_error(502, "  bad gateway ").message(), "502 the server failed: bad gateway")
+    test.assert_eq_str(llmcopenai.decode_error(500, "").message(), "500 the server failed: the response had no body")
+    test.assert(llmcfault.is_retryable(llmcopenai.decode_error(429, "{}")))
+
+fn events_of(data: Str) -> [LlmcEvent]
+    match llmcopenai.events_of_frame(LlmcSseFrame { event: "", data: data, id: "", retry_ms: 0 - 1 })
+        Ok(es) => es
+        Err(_) => []
+
+@test
+fn test_documented_stream_chunks_become_events() [io]
+    test.case("the first chunk carries the role: a start, and a text delta")
+    let first = events_of("{\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hel\"},\"finish_reason\":null}]}")
+    test.assert(list.len(first) == 2)
+    match first[0]
+        LlmcEventStart(id, model) =>
+            test.assert(id == "chatcmpl-123")
+            test.assert(model == "gpt-4o-mini")
+        _                         => test.fail("no start")
+    test.assert(llmcsse.text_delta(first[1]) == "Hel")
+
+    test.case("a tool call opens with its id and name, then arguments arrive by index")
+    let open = events_of("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"type\":\"function\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}")
+    test.assert(list.len(open) == 1)
+    match open[0]
+        LlmcEventToolStart(index, id, name) =>
+            test.assert(index == 0)
+            test.assert(id == "call_a")
+            test.assert(name == "get_weather")
+        _                                   => test.fail("no tool start")
+    let args = events_of("{\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\": \\\"Cope\"}}]}}]}")
+    test.assert(list.len(args) == 1)
+    match args[0]
+        LlmcEventToolArgs(index, delta) =>
+            test.assert(index == 0)
+            test.assert(delta == "{\"city\": \"Cope")
+        _                               => test.fail("no args")
+
+    test.case("the finish chunk and the usage-only chunk")
+    let fin = events_of("{\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}")
+    test.assert(list.len(fin) == 1)
+    match fin[0]
+        LlmcEventStop(stop) => test.assert(llmcreply.is_truncated(LlmcReply { stop: stop,
+            text: "",
+            tool_calls: [],
+            usage: llmcreply.no_usage(),
+            model: "",
+            id: "" }))
+        _                   => test.fail("no stop")
+    let usage = events_of("{\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":3}}")
+    test.assert(list.len(usage) == 1)
+    match usage[0]
+        LlmcEventUsage(u) => test.assert(u.input_tokens == 9 and u.output_tokens == 3)
+        _                 => test.fail("no usage")
+
+    test.case("a null usage is not a report, the sentinel is not JSON, and junk is refused")
+    test.assert(list.len(events_of("{\"choices\":[{\"delta\":{}}],\"usage\":null}")) == 0)
+    test.assert(list.len(events_of("[DONE]")) == 0)
+    match llmcopenai.events_of_frame(LlmcSseFrame { event: "", data: "{broken", id: "", retry_ms: 0 - 1 })
+        Ok(_)  => test.fail("junk decoded")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no stream chunk as JSON")
+
+@test
+fn test_a_whole_documented_stream_folds_to_one_reply() [io]
+    let frames = ["{\"id\":\"c1\",\"model\":\"m\",\"choices\":[{\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"get_weather\",\"arguments\":\"\"}}]}}]}",
+                  "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}",
+                  "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\" \\\"Oslo\\\"}\"}}]}}]}",
+                  "{\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}",
+                  "{\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6}}"]
+    var s = llmcsse.stream()
+    for f in frames
+        s = llmcsse.apply_all(s, events_of(f))
+    match llmcsse.finish(s)
+        Err(f) => test.fail(f.message())
+        Ok(r)  =>
+            test.assert(llmcreply.wants_tools(r))
+            test.assert(r.tool_calls[0].arguments == "{\"city\": \"Oslo\"}")
+            test.assert(r.usage.output_tokens == 6)
+            test.assert(r.id == "c1")
+
+@test
+fn test_model_names() [io]
+    test.assert(llmcopenai.is_model_name("gpt-4o-mini"))
+    test.assert(llmcopenai.is_model_name("llama3:8b"))
+    test.assert(not llmcopenai.is_model_name("openai:gpt-4o-mini"))
+    test.assert(not llmcopenai.is_model_name(""))
+    test.assert(str.len(llmcopenai.LLMC_OPENAI_DONE) == 6)
+    test.assert(llmcopenai.LLMC_OPENAI_BASE_URL == llmcreq.provider_base_url(llmcreq.openai("")))
+    test.assert(llmcopenai.LLMC_OPENAI_CHAT_PATH == llmcreq.chat_path(llmcreq.openai("")))

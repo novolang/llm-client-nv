@@ -1,8 +1,6 @@
 // llmcreply.nv — what came back, and the two ways it is not what it
 // looks like.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.  A reply is a value both dialects decode into.
 //
 // **THIS MODULE IS THE LOAD-BEARING INTERFACE OF THE PACKAGE.**
@@ -40,6 +38,7 @@
 // bytes go out.
 
 use std.list
+use std.json
 use promptmsg
 use llmcfault
 
@@ -90,7 +89,10 @@ pub enum LlmcStop
 //     // : false
 // ```
 pub fn is_complete(s: LlmcStop) -> Bool []
-    todo("llm-client-nv.llmcreply.is_complete")
+    match s
+        LlmcStopEnd         => true
+        LlmcStopSequence(_) => true
+        _                   => false
 
 // One sentence a program can show a person when `is_complete` is
 // false.
@@ -106,7 +108,13 @@ pub fn is_complete(s: LlmcStop) -> Bool []
 //     println(llmcreply.stop_note(LlmcStopMaxTokens))
 // ```
 pub fn stop_note(s: LlmcStop) -> Str []
-    todo("llm-client-nv.llmcreply.stop_note")
+    match s
+        LlmcStopEnd             => ""
+        LlmcStopSequence(which) => ""
+        LlmcStopMaxTokens       => "the answer was cut off at the length limit"
+        LlmcStopToolUse         => "the model asked for tools instead of answering"
+        LlmcStopFiltered(why)   => "the provider stopped the answer (${why})"
+        LlmcStopOther(raw)      => "the answer ended for a reason this client does not know (${raw})"
 
 // The OpenAI dialect's `finish_reason`, as a stop.
 //
@@ -118,7 +126,16 @@ pub fn stop_note(s: LlmcStop) -> Str []
 //     // : false
 // ```
 pub fn stop_of_openai(raw: Str) -> LlmcStop []
-    todo("llm-client-nv.llmcreply.stop_of_openai")
+    if raw == "stop"
+        LlmcStopEnd
+    elif raw == "length"
+        LlmcStopMaxTokens
+    elif raw == "tool_calls" or raw == "function_call"
+        LlmcStopToolUse
+    elif raw == "content_filter"
+        LlmcStopFiltered(raw)
+    else
+        LlmcStopOther(raw)
 
 // The Anthropic dialect's `stop_reason`, as a stop.
 //
@@ -130,7 +147,18 @@ pub fn stop_of_openai(raw: Str) -> LlmcStop []
 //     // : true
 // ```
 pub fn stop_of_anthropic(raw: Str) -> LlmcStop []
-    todo("llm-client-nv.llmcreply.stop_of_anthropic")
+    if raw == "end_turn"
+        LlmcStopEnd
+    elif raw == "max_tokens"
+        LlmcStopMaxTokens
+    elif raw == "tool_use"
+        LlmcStopToolUse
+    elif raw == "refusal"
+        LlmcStopFiltered(raw)
+    elif raw == "stop_sequence"
+        LlmcStopSequence("")
+    else
+        LlmcStopOther(raw)
 
 // One tool the model asked for.
 pub struct LlmcToolCall
@@ -170,7 +198,9 @@ pub struct LlmcToolCall
 //         Err(_) => false
 // ```
 pub fn arguments_json(c: LlmcToolCall) -> Result<JsonValueH, LlmcFault> []
-    todo("llm-client-nv.llmcreply.arguments_json")
+    match json.parse(c.arguments)
+        Some(v) => Ok(v)
+        None    => Err(LlmcMalformedReply("arguments of tool call ${c.id} as JSON"))
 
 // What the request and the reply cost.
 //
@@ -206,7 +236,8 @@ pub struct LlmcUsage
 //     // : 0
 // ```
 pub fn no_usage() -> LlmcUsage []
-    todo("llm-client-nv.llmcreply.no_usage")
+    LlmcUsage { input_tokens: 0, output_tokens: 0, cached_input_tokens: 0,
+                reasoning_tokens: 0 }
 
 // Input plus output.
 //
@@ -218,7 +249,7 @@ pub fn no_usage() -> LlmcUsage []
 //     // : 0
 // ```
 pub fn total_tokens(u: LlmcUsage) -> Int []
-    todo("llm-client-nv.llmcreply.total_tokens")
+    u.input_tokens + u.output_tokens
 
 // Two usages added, for a loop that ran many turns.
 //
@@ -231,7 +262,10 @@ pub fn total_tokens(u: LlmcUsage) -> Int []
 //     // : 0
 // ```
 pub fn add_usage(a: LlmcUsage, b: LlmcUsage) -> LlmcUsage []
-    todo("llm-client-nv.llmcreply.add_usage")
+    LlmcUsage { input_tokens: a.input_tokens + b.input_tokens,
+                output_tokens: a.output_tokens + b.output_tokens,
+                cached_input_tokens: a.cached_input_tokens + b.cached_input_tokens,
+                reasoning_tokens: a.reasoning_tokens + b.reasoning_tokens }
 
 // One reply, from either dialect.
 pub struct LlmcReply
@@ -282,7 +316,11 @@ pub struct LlmcReply
 //     list.len(llmcreply.owed_tool_results(r))
 // ```
 pub fn owed_tool_results(r: LlmcReply) -> [Str] []
-    todo("llm-client-nv.llmcreply.owed_tool_results")
+    var ids: [Str] = []
+    if r.stop == LlmcStopToolUse
+        for c in r.tool_calls
+            list.push(ids, c.id)
+    ids
 
 // Which of this reply's obligations a conversation does NOT discharge.
 //
@@ -299,7 +337,15 @@ pub fn owed_tool_results(r: LlmcReply) -> [Str] []
 //     list.len(llmcreply.unanswered(r, c)) == 0
 // ```
 pub fn unanswered(r: LlmcReply, c: PromptConvo) -> [Str] []
-    todo("llm-client-nv.llmcreply.unanswered")
+    var open: [Str] = []
+    for id in owed_tool_results(r)
+        var answered = false
+        for m in c.messages
+            if m.role == PromptTool and m.call_id == id
+                answered = true
+        if not answered
+            list.push(open, id)
+    open
 
 // The assistant turn to append to the conversation.
 //
@@ -317,18 +363,21 @@ pub fn unanswered(r: LlmcReply, c: PromptConvo) -> [Str] []
 //     promptmsg.role_name(llmcreply.to_message(r).role)
 // ```
 pub fn to_message(r: LlmcReply) -> PromptMessage []
-    todo("llm-client-nv.llmcreply.to_message")
+    promptmsg.assistant(r.text)
 
 // The whole assistant turn as prompt-nv messages.
 //
 // What to append before answering the tool calls.  The message list is
 // the lossy direction and this names the loss: prompt-nv's message is
-// text plus a role, so the tool-call ARGUMENTS do not survive a round
-// trip through it — which is fine for the next request, because the
-// provider has its own copy of the turn, and is not fine for a
-// transcript a program replays. `llmcopenai.assistant_turn` and
-// `llmcanthro.assistant_turn` are the lossless forms, and both are
-// published for exactly that reason.
+// text plus a role, so a tool call is written as an assistant message
+// that carries the tool's `name`, the `call_id`, and the arguments
+// text in `text`.  The encoders turn a run of those back into
+// `tool_calls` (OpenAI) or `tool_use` blocks (Anthropic), which is what
+// lets the next request be sent: both providers refuse a tool result
+// whose call was not made.  What is lost is the ORDER of text and calls
+// within a turn (the text comes first), the usage, the model and the
+// id; `llmcopenai.assistant_turn` and `llmcanthro.assistant_turn` are
+// the lossless forms for a transcript a program replays.
 //
 // ```novo
 // use llmcreply
@@ -337,7 +386,13 @@ pub fn to_message(r: LlmcReply) -> PromptMessage []
 //     list.len(llmcreply.to_messages(r))
 // ```
 pub fn to_messages(r: LlmcReply) -> [PromptMessage] []
-    todo("llm-client-nv.llmcreply.to_messages")
+    var out: [PromptMessage] = []
+    if r.text != "" or list.len(r.tool_calls) == 0
+        list.push(out, promptmsg.assistant(r.text))
+    for c in r.tool_calls
+        list.push(out, PromptMessage { role: PromptAssistant, text: c.arguments,
+                                       name: c.name, call_id: c.id })
+    out
 
 // Whether the reply is a prefix of an answer rather than an answer.
 //
@@ -352,7 +407,7 @@ pub fn to_messages(r: LlmcReply) -> [PromptMessage] []
 //     llmcreply.is_truncated(r) == false
 // ```
 pub fn is_truncated(r: LlmcReply) -> Bool []
-    todo("llm-client-nv.llmcreply.is_truncated")
+    r.stop == LlmcStopMaxTokens
 
 // Whether the model asked for tools this turn.
 //
@@ -363,7 +418,7 @@ pub fn is_truncated(r: LlmcReply) -> Bool []
 //     llmcreply.wants_tools(r)
 // ```
 pub fn wants_tools(r: LlmcReply) -> Bool []
-    todo("llm-client-nv.llmcreply.wants_tools")
+    list.len(r.tool_calls) > 0
 
 // The one tool call with this id, or None.
 //
@@ -376,7 +431,10 @@ pub fn wants_tools(r: LlmcReply) -> Bool []
 //         None    => false
 // ```
 pub fn call_by_id(r: LlmcReply, id: Str) -> ?LlmcToolCall []
-    todo("llm-client-nv.llmcreply.call_by_id")
+    for c in r.tool_calls
+        if c.id == id
+            return Some(c)
+    None
 
 // The reply's text parsed as JSON.
 //
@@ -394,7 +452,9 @@ pub fn call_by_id(r: LlmcReply, id: Str) -> ?LlmcToolCall []
 //         Err(_) => false
 // ```
 pub fn json_of(r: LlmcReply) -> Result<JsonValueH, LlmcFault> []
-    todo("llm-client-nv.llmcreply.json_of")
+    match json.parse(r.text)
+        Some(v) => Ok(v)
+        None    => Err(LlmcMalformedReply("text as JSON"))
 
 // An empty reply, for a test fixture or an accumulator's zero.
 //
@@ -406,4 +466,5 @@ pub fn json_of(r: LlmcReply) -> Result<JsonValueH, LlmcFault> []
 //     // :
 // ```
 pub fn empty_reply() -> LlmcReply []
-    todo("llm-client-nv.llmcreply.empty_reply")
+    LlmcReply { stop: LlmcStopEnd, text: "", tool_calls: [], usage: no_usage(),
+                model: "", id: "" }

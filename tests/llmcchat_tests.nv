@@ -1,9 +1,5 @@
 // llmcchat_tests.nv — a whole exchange with no socket in it.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// llm-client-nv.<module>.<fn>`.
-//
 // THE COMPILER MAKES THE FIRST ASSERTION BEFORE THE RUN STARTS.
 // `LlmcScript` below implements `LlmcTransport[]` — a transport over
 // bytes already in memory — and the functions that drive a request
@@ -112,17 +108,19 @@ fn test_the_encode_and_decode_halves_are_usable_without_a_transport() [io]
 @test
 fn test_a_stream_is_opened_and_pumped_by_the_caller_s_own_loop() [io]
     let wire = "data: {\"choices\":[{\"delta\":{\"content\":\"Cope\"}}]}\n\ndata: [DONE]\n\n"
-    let t = script(wire)
+    var t = script(wire)
+    t = LlmcScript { status: 200, headers: ["Content-Type: text/event-stream"],
+                     body: t.body, open: true }
     let c = a_client()
     let r = llmcreq.streaming(a_request())
 
-    match llmcchat.stream_open(c, t, r)
+    match llmcchat.stream_open(c, var t, r)
         Err(_) => test.assert(false)
         Ok(s)  =>
             test.case("nothing has been read yet")
             test.assert(s.read_bytes == 0)
 
-            match llmcchat.stream_next(c, t, s)
+            match llmcchat.stream_next(c, var t, s)
                 Err(_)   => test.assert(false)
                 Ok(step) =>
                     test.case("and one read produces the events it completed")

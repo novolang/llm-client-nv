@@ -1,8 +1,6 @@
 // llmcchat.nv — the client: one call, either dialect, whatever the
 // caller's transport costs.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // EVERY SESSION FUNCTION HERE IS EFFECT-POLYMORPHIC.  `send` declares
 // `[e]` and is charged what the transport behind `T` supplies — `[net]`
 // over TLS, `[io, net, time, async]` over the standard library's HTTP
@@ -27,7 +25,16 @@
 // the caller owns, every call takes one and returns a reply, and a
 // context manager can evict from it because it can see it.
 
+use std.bytes
+use std.json
 use std.list
+use std.str
+use promptmsg
+use schcompile
+use scherror
+use schvalidate
+use llmcanthro
+use llmcopenai
 use llmcreq
 use llmcreply
 use llmcretry
@@ -59,7 +66,7 @@ pub struct LlmcClient
 //     println("${llmcchat.client(llmcreq.openai("sk-test")).deadline_ms}")
 // ```
 pub fn client(p: LlmcProvider) -> LlmcClient []
-    todo("llm-client-nv.llmcchat.client")
+    LlmcClient { provider: p, retry: llmcretry.retry(), deadline_ms: 120000 }
 
 // The same client with another retry policy.
 //
@@ -75,7 +82,7 @@ pub fn client(p: LlmcProvider) -> LlmcClient []
 //     // : 1
 // ```
 pub fn with_retry(c: LlmcClient, p: LlmcRetry) -> LlmcClient []
-    todo("llm-client-nv.llmcchat.with_retry")
+    LlmcClient { provider: c.provider, retry: p, deadline_ms: c.deadline_ms }
 
 // The same client with another whole-request deadline.
 //
@@ -89,7 +96,7 @@ pub fn with_retry(c: LlmcClient, p: LlmcRetry) -> LlmcClient []
 //     // : 120000
 // ```
 pub fn with_deadline_ms(c: LlmcClient, ms: Int) -> LlmcClient []
-    todo("llm-client-nv.llmcchat.with_deadline_ms")
+    LlmcClient { provider: c.provider, retry: c.retry, deadline_ms: ms }
 
 // The request body this client would send, in this client's dialect.
 //
@@ -108,7 +115,13 @@ pub fn with_deadline_ms(c: LlmcClient, ms: Int) -> LlmcClient []
 //         Err(_) => false
 // ```
 pub fn encode(c: LlmcClient, r: LlmcRequest) -> Result<[u8], LlmcFault> []
-    todo("llm-client-nv.llmcchat.encode")
+    var text = ""
+    match c.provider.dialect
+        LlmcOpenAiChat        =>
+            text = llmcopenai.encode_body(c.provider, r)!
+        LlmcAnthropicMessages =>
+            text = llmcanthro.encode_body(c.provider, r)!
+    Ok(bytes.to_byte_list(bytes.from_str(text)))
 
 // Every header this client would send for this request.
 //
@@ -124,7 +137,12 @@ pub fn encode(c: LlmcClient, r: LlmcRequest) -> Result<[u8], LlmcFault> []
 //     list.len(llmcchat.headers_for(c, r))
 // ```
 pub fn headers_for(c: LlmcClient, r: LlmcRequest) -> [Str] []
-    todo("llm-client-nv.llmcchat.headers_for")
+    var hs = llmcreq.auth_headers(c.provider)
+    if r.stream
+        list.push(hs, "Accept: text/event-stream")
+    for h in llmcretry.idempotency_headers(c.retry)
+        list.push(hs, h)
+    hs
 
 // A response this client would have received, as a reply or a fault.
 //
@@ -144,7 +162,14 @@ pub fn headers_for(c: LlmcClient, r: LlmcRequest) -> [Str] []
 // ```
 pub fn decode(c: LlmcClient, status: Int, headers: [Str],
               body: [u8]) -> Result<LlmcReply, LlmcFault> []
-    todo("llm-client-nv.llmcchat.decode")
+    let text = bytes.to_str(bytes.from_byte_list(widened(body)))
+    if status >= 200 and status < 300
+        match c.provider.dialect
+            LlmcOpenAiChat        =>
+                return llmcopenai.decode_reply(text)
+            LlmcAnthropicMessages =>
+                return llmcanthro.decode_reply(text)
+    Err(fault_of(c, status, headers, body))
 
 // One SSE frame decoded in this client's dialect.
 //
@@ -161,7 +186,9 @@ pub fn decode(c: LlmcClient, status: Int, headers: [Str],
 //         Err(_) => false
 // ```
 pub fn decode_frame(c: LlmcClient, f: LlmcSseFrame) -> Result<[LlmcEvent], LlmcFault> []
-    todo("llm-client-nv.llmcchat.decode_frame")
+    match c.provider.dialect
+        LlmcOpenAiChat        => llmcopenai.events_of_frame(f)
+        LlmcAnthropicMessages => llmcanthro.events_of_frame(f)
 
 // Send one request and read one reply.
 //
@@ -173,12 +200,17 @@ pub fn decode_frame(c: LlmcClient, f: LlmcSseFrame) -> Result<[LlmcEvent], LlmcF
 // use llmcchat
 // use llmchttp
 //
-// fn ask(c: LlmcClient, t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net]
-//     llmcchat.send(c, t, r)
+// fn ask(c: LlmcClient, var t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net]
+//     llmcchat.send(c, var t, r)
 // ```
-pub fn send<T: LlmcTransport[e]>(c: LlmcClient, t: T,
+pub fn send<T: LlmcTransport[e]>(c: LlmcClient, var t: T,
                                  r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [e]
-    todo("llm-client-nv.llmcchat.send")
+    if r.stream
+        return Err(LlmcUnsupported("a streaming request", "send; stream_open reads it"))
+    let body = encode(c, r)!
+    let reply = t.llmc_exchange("POST", llmcreq.chat_path(c.provider),
+                                headers_for(c, r), body)!
+    Ok(settle(c, r, decode(c, reply.status, reply.headers, reply.body)!))
 
 // Send one request, retrying by the client's policy, sleeping between
 // attempts.
@@ -192,12 +224,30 @@ pub fn send<T: LlmcTransport[e]>(c: LlmcClient, t: T,
 // use llmcchat
 // use llmchttp
 //
-// fn ask(c: LlmcClient, t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net, time]
-//     llmcchat.send_retrying(c, t, r, [0.5, 0.5])
+// fn ask(c: LlmcClient, var t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcReply, LlmcFault> [net, time]
+//     llmcchat.send_retrying(c, var t, r, [0.5, 0.5])
 // ```
-pub fn send_retrying<T: LlmcTransport[e]>(c: LlmcClient, t: T, r: LlmcRequest,
+pub fn send_retrying<T: LlmcTransport[e]>(c: LlmcClient, var t: T, r: LlmcRequest,
                                           us: [Float]) -> Result<LlmcReply, LlmcFault> [e, time]
-    todo("llm-client-nv.llmcchat.send_retrying")
+    let started = llmcretry.now_ms()
+    var attempt = 1
+    loop
+        match send(c, var t, r)
+            Ok(reply) =>
+                return Ok(reply)
+            Err(f)    =>
+                var u = 0.5
+                if attempt <= list.len(us)
+                    u = us[attempt - 1]
+                match llmcretry.next_delay_ms(c.retry, attempt, f, llmcretry.no_limits(), u)
+                    None     =>
+                        return Err(f)
+                    Some(ms) =>
+                        let now = llmcretry.now_ms()
+                        if llmcretry.deadline_passed(started, c.deadline_ms, now + ms)
+                            return Err(LlmcTimedOut(llmcretry.elapsed_ms(started, now)))
+                        core.rt.sleep_ms(ms)
+                        attempt = attempt + 1
 
 // Open a streamed request and answer the reader to drain.
 //
@@ -210,12 +260,29 @@ pub fn send_retrying<T: LlmcTransport[e]>(c: LlmcClient, t: T, r: LlmcRequest,
 // use llmcchat
 // use llmchttp
 //
-// fn open(c: LlmcClient, t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcStreamState, LlmcFault> [net]
-//     llmcchat.stream_open(c, t, r)
+// fn open(c: LlmcClient, var t: LlmcTlsHttp, r: LlmcRequest) -> Result<LlmcStreamState, LlmcFault> [net]
+//     llmcchat.stream_open(c, var t, r)
 // ```
-pub fn stream_open<T: LlmcTransport[e]>(c: LlmcClient, t: T,
+pub fn stream_open<T: LlmcTransport[e]>(c: LlmcClient, var t: T,
                                         r: LlmcRequest) -> Result<LlmcStreamState, LlmcFault> [e]
-    todo("llm-client-nv.llmcchat.stream_open")
+    let streaming = llmcreq.streaming(r)
+    let body = encode(c, streaming)!
+    let head = t.llmc_open("POST", llmcreq.chat_path(c.provider),
+                           headers_for(c, streaming), body)!
+    if head.status < 200 or head.status >= 300
+        var rest: [u8] = []
+        loop
+            let chunk = t.llmc_read(65536)!
+            if list.len(chunk) == 0
+                break
+            for b in chunk
+                list.push(rest, b)
+        return Err(fault_of(c, head.status, head.headers, rest))
+    if not llmchttp.is_event_stream(head.headers)
+        let kind = llmchttp.header_of(head.headers, "content-type") ?? "none"
+        return Err(LlmcUnsupported("a streamed reply", "this server, which answered content type ${kind}"))
+    Ok(LlmcStreamState { reader: llmcsse.reader(), acc: llmcsse.stream(),
+                         dialect: c.provider.dialect, read_bytes: 0 })
 
 // A streamed reply in progress: the frame reader, the accumulator and
 // the client's dialect.
@@ -243,12 +310,32 @@ pub struct LlmcStreamState
 // use llmcchat
 // use llmchttp
 //
-// fn pump(c: LlmcClient, t: LlmcTlsHttp, s: LlmcStreamState) -> Result<LlmcStreamStep, LlmcFault> [net]
-//     llmcchat.stream_next(c, t, s)
+// fn pump(c: LlmcClient, var t: LlmcTlsHttp, s: LlmcStreamState) -> Result<LlmcStreamStep, LlmcFault> [net]
+//     llmcchat.stream_next(c, var t, s)
 // ```
-pub fn stream_next<T: LlmcTransport[e]>(c: LlmcClient, t: T,
+pub fn stream_next<T: LlmcTransport[e]>(c: LlmcClient, var t: T,
                                         s: LlmcStreamState) -> Result<LlmcStreamStep, LlmcFault> [e]
-    todo("llm-client-nv.llmcchat.stream_next")
+    let chunk = t.llmc_read(65536)!
+    if list.len(chunk) == 0
+        if llmcsse.finished(s.acc)
+            return Ok(LlmcStreamStep { state: s, events: [] })
+        return Err(LlmcStreamTruncated(str.len(s.acc.text)))
+    var events: [LlmcEvent] = []
+    var acc = s.acc
+    var step = llmcsse.feed(s.reader, chunk)!
+    loop
+        match step.frame
+            None        =>
+                break
+            Some(frame) =>
+                for e in decode_frame(c, frame)!
+                    list.push(events, e)
+                    acc = llmcsse.apply(acc, e)
+                step = llmcsse.take(step.reader)!
+    Ok(LlmcStreamStep { state: LlmcStreamState { reader: step.reader, acc: acc,
+                                                 dialect: s.dialect,
+                                                 read_bytes: s.read_bytes + list.len(chunk) },
+                        events: events })
 
 // A stream's state and the events one read produced.
 pub struct LlmcStreamStep
@@ -280,7 +367,28 @@ pub struct LlmcStreamStep
 //         Err(_) => false
 // ```
 pub fn validate_format(r: LlmcRequest, reply: LlmcReply) -> Result<[Str], LlmcFault> []
-    todo("llm-client-nv.llmcchat.validate_format")
+    var schema_doc = json.null()
+    match r.format
+        LlmcFormatText                 =>
+            return Ok([])
+        LlmcFormatJson                 => 0
+        LlmcFormatSchema(_, schema, _) =>
+            schema_doc = schema
+    let instance = match json.parse(reply.text)
+        Some(v) => v
+        None    =>
+            return Ok(["the reply text is not JSON"])
+    match r.format
+        LlmcFormatSchema(_, _, _) =>
+            let compiled = match schcompile.compile(schema_doc)
+                Ok(s)  => s
+                Err(f) =>
+                    return Err(LlmcBadEncoding("the response schema does not compile: ${scherror.message(f)}"))
+            var found: [Str] = []
+            for u in schvalidate.validate(compiled, instance).errors
+                list.push(found, "${u.instance_location}: ${u.message}")
+            Ok(found)
+        _                         => Ok([])
 
 // The conversation with this reply's turn appended.
 //
@@ -298,7 +406,7 @@ pub fn validate_format(r: LlmcRequest, reply: LlmcReply) -> Result<[Str], LlmcFa
 //     promptmsg.turn_count(llmcchat.append_reply(c, r))
 // ```
 pub fn append_reply(c: PromptConvo, r: LlmcReply) -> PromptConvo []
-    todo("llm-client-nv.llmcchat.append_reply")
+    promptmsg.extend(c, llmcreply.to_messages(r))
 
 // The conversation with one tool result appended, answering one call.
 //
@@ -315,7 +423,7 @@ pub fn append_reply(c: PromptConvo, r: LlmcReply) -> PromptConvo []
 //     promptmsg.turn_count(llmcchat.append_tool_result(c, call, "17 degrees"))
 // ```
 pub fn append_tool_result(c: PromptConvo, call: LlmcToolCall, content: Str) -> PromptConvo []
-    todo("llm-client-nv.llmcchat.append_tool_result")
+    promptmsg.push(c, promptmsg.tool_result(call.name, call.id, content))
 
 // What this client would ask for, as one line, with the key redacted.
 //
@@ -332,4 +440,53 @@ pub fn append_tool_result(c: PromptConvo, call: LlmcToolCall, content: Str) -> P
 //     llmcchat.describe(c, r)
 // ```
 pub fn describe(c: LlmcClient, r: LlmcRequest) -> Str []
-    todo("llm-client-nv.llmcchat.describe")
+    "${llmcreq.redacted(c.provider)} model=${r.model} stream=${r.stream} tools=${list.len(r.tools)}"
+
+// A byte list widened to the `[Int]` that `bytes.from_byte_list` takes.
+fn widened(body: [u8]) -> [Int]
+    list.map(body, b => b as Int)
+
+// A decoded reply put into the shape the request asked for.
+//
+// Anthropic's Messages API has no `response_format`: a schema is
+// obtained by forcing one tool whose input is the shape
+// (`llmcanthro.encode_format`).  The reply then carries the JSON as
+// that tool's arguments and a `tool_use` stop.  Putting the arguments
+// back in `text`, dropping the synthetic call and reporting the stop
+// as an end of turn makes a caller that asked for a shape read it in
+// the same place under either dialect.  Every other reply is returned
+// as it is.
+//
+// Public so a caller that drains a stream itself applies the same
+// rule to `llmcsse.finish`'s reply.
+pub fn settle(c: LlmcClient, r: LlmcRequest, reply: LlmcReply) -> LlmcReply
+    if c.provider.dialect != LlmcAnthropicMessages
+        return reply
+    match r.format
+        LlmcFormatSchema(name, _, _) =>
+            var kept: [LlmcToolCall] = []
+            var shaped = reply.text
+            var used = false
+            for call in reply.tool_calls
+                if call.name == name and not used
+                    shaped = call.arguments
+                    used = true
+                else
+                    list.push(kept, call)
+            if not used
+                return reply
+            var stop = reply.stop
+            if list.len(kept) == 0 and stop == LlmcStopToolUse
+                stop = LlmcStopEnd
+            LlmcReply { stop: stop, text: shaped, tool_calls: kept, usage: reply.usage,
+                        model: reply.model, id: reply.id }
+        _                            => reply
+
+// The fault a non-2xx response is: the dialect's reading of its error
+// body, with the delay the headers name when it is a rate limit.
+fn fault_of(c: LlmcClient, status: Int, headers: [Str], body: [u8]) -> LlmcFault
+    let text = bytes.to_str(bytes.from_byte_list(widened(body)))
+    var fault = llmcopenai.decode_error(status, text)
+    if c.provider.dialect == LlmcAnthropicMessages
+        fault = llmcanthro.decode_error(status, text)
+    llmcfault.with_retry_after(fault, llmcretry.limits_of(headers).retry_after_ms)

@@ -5,6 +5,110 @@ All notable changes to llm-client-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
+## 0.1.0 — 2026-10-29
+
+The **implementation**.  Every `todo()` body in the nine modules is
+written.  The dependency ranges move to prompt-nv `^0.1.0` and
+tokenizers-nv `^0.1.0`, the first releases that have bodies.  The suites
+are green, line coverage over `src/` is 100%, and the expected values are
+written by hand from the published API references, not produced by this
+package.
+
+### Breaking, against the 0.0.3 interface
+
+- **`LlmcTransport`'s four methods take `var self`**, and `send`,
+  `send_retrying`, `stream_open` and `stream_next` take `var t`.  A
+  streamed exchange has to remember its connection between `llmc_open`
+  and `llmc_read`, and the language refuses a write through a plain
+  `self`.  An implementor writes `fn llmc_read(var self, …)`; a caller
+  writes `llmcchat.send(c, var t, r)`.  The shared state is a one-slot
+  list in the transport value, so every copy of it sees the same
+  connection.
+- **`LlmcTlsHttp` is `{ host, port, timeout_ms, var wire }`** and no longer
+  has `conn`.  It dials again when an exchange has used its connection,
+  because a request says `Connection: close`; `dial_tls` still connects
+  at once so a refusal arrives there.  **`LlmcStdHttp` gains `var live`.**
+  `LlmcLive` and `LlmcWire` are new public structs, the values in those
+  slots.
+- **Anthropic's `input_tokens` is the sum of the three counts** the API
+  reports (`input_tokens`, `cache_read_input_tokens` and
+  `cache_creation_input_tokens`), and `cached_input_tokens` is the read
+  part.  The API's own `input_tokens` counts only the tokens that were not
+  read from the cache, so the interface's reading ("the whole input,
+  cache included") needed the sum.  `tests/llmcreply_tests.nv` asserted
+  1200 for a reply reporting 1200 and a cache read of 1024; it asserts
+  2224 now, with the arithmetic beside it.
+- **`llmcreply.to_messages` keeps the arguments.**  A tool call is an
+  assistant message that carries `name`, `call_id` and the arguments text
+  in `text`.  The interface said the arguments do not survive the round
+  trip through prompt-nv's message, and a conversation built that way
+  could not be sent: both providers refuse a tool result whose call was
+  not made.  The encoders now turn those messages back into
+  `tool_calls` and `tool_use` blocks, so `append_reply`,
+  `append_tool_result` and `send` close an agent loop without a second
+  message type.
+
+### Added
+
+- `llmcreq.is_call` (an assistant message that is a tool call),
+  `llmcreq.is_qualified_model` (the check behind both `is_model_name`s;
+  a provider prefix is refused, an Ollama tag such as `llama3:8b` is
+  not) and `llmcchat.settle` (puts the forced schema tool's arguments back
+  in `text` for the Anthropic dialect; `send` applies it, a caller that
+  drains a stream applies it to `llmcsse.finish`'s reply).
+
+### Behaviour the interface left open
+
+- **`llmcreq.check`** refuses an empty model, a conversation prompt-nv
+  refuses, `max_tokens` of zero, a tool result with no call id, a result
+  whose call was not made before it, a call with no result after it, a
+  forced tool that is not offered, and, for Anthropic, a bare JSON format
+  and a schema beside tools.
+- **A stream's first stop wins.**  Anthropic names the reason on
+  `message_delta` and ends with a bare `message_stop`, which is read as an
+  end of turn; the later one does not turn `max_tokens` into an end.
+  Usage merges: a field the newer report leaves at zero keeps its earlier
+  value.  A tool call that follows a text block starts at index 1, and the
+  empty slot at 0 is not a call.
+- **`stream_open` refuses a reply that is not an event stream**, naming
+  the content type it got: a server that ignores `stream` would otherwise
+  read as a truncated stream.  `send` refuses a request that streams.
+- **`stream_next` answers `LlmcStreamTruncated` when the peer closes before
+  a stop**, and an empty step when it closes after one.
+- **An OpenAI reply with tool calls and `finish_reason: "stop"`** is read as
+  a tool-use turn, because the results are still owed.  Arguments sent as
+  an object (Ollama does) are kept as text.
+- **`LlmcOverloaded` waits at least half the ceiling**, and a rate limit
+  waits for the reset of the bucket that reports zero remaining.
+- **`retry_after_from` takes Unix milliseconds**, because an HTTP date is a
+  wall-clock time; `now_ms` is the monotonic clock and is for durations.
+- **The Anthropic reset headers are RFC 3339 times**, which need a clock to
+  become a delay, so `limits_of` reads them as absent (-1) and the OpenAI
+  duration spellings and `Retry-After` as delays.
+- Defaults: three attempts, a 500 ms base, a 30 s ceiling and a
+  120 second whole-request deadline.
+
+### Known
+
+- **`LlmcStdHttp` decodes chunked bodies itself.**  The standard library's
+  `HttpReplyReader.read` returns the chunk size lines with the data
+  (`http-reply-reader-read-hands-back-the-chunk-framing-of-a-chunked-body`).
+  The decoder is http-codec-nv's reader, primed with a chunked head; the
+  site carries the workaround tag.
+- **A failed TLS read leaks its buffer in the runtime**
+  (`tls-recv-leaks-its-receive-buffer-when-the-read-fails`).  Three tests
+  in `tests/llmcnet_tests.nv` read until the peer closes, pass their
+  assertions and fail the run's leak check; `tests/coverage.sh` runs with
+  the check off, as the other transport suites do.
+- **A method call straight on a struct field leaks its receiver**
+  (`a-method-call-on-a-struct-field-leaks-the-receiver`).  Three sites
+  bind the field to a local first and carry the workaround tag.
+- **`tls.recv` cannot tell a receive deadline from an abrupt close**
+  (`tls-recv-cannot-tell-a-receive-deadline-from-an-abrupt-close`).  An
+  empty read is a close when the detail says the peer ended and a
+  deadline otherwise; the site carries the workaround tag.
+- The package has no device claim.  It is `host`.
+
 ## 0.0.3 — 2026-09-28
 
 The dependency ranges move to the releases published on 2026-09-28:

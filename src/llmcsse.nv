@@ -1,8 +1,6 @@
 // llmcsse.nv — the streamed reply: server-sent event frames, and the
 // accumulator that turns them back into one reply.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout, feed-and-drain, with the loop in the host.  The
 // caller reads bytes off its own transport and hands them here; this
 // answers frames, the dialect turns a frame into events, and
@@ -45,6 +43,8 @@
 // it anyway, named so that showing it is a decision.
 
 use std.bytes
+use std.list
+use std.str
 use llmcfault
 use llmcreply
 
@@ -86,7 +86,7 @@ pub struct LlmcSseStep
 //     println("${llmcsse.reader().max_frame}")
 // ```
 pub fn reader() -> LlmcSseReader []
-    todo("llm-client-nv.llmcsse.reader")
+    reader_with(1048576)
 
 // A reader that refuses a frame larger than `max_frame` bytes.
 //
@@ -103,7 +103,7 @@ pub fn reader() -> LlmcSseReader []
 //     // : 65536
 // ```
 pub fn reader_with(max_frame: Int) -> LlmcSseReader []
-    todo("llm-client-nv.llmcsse.reader_with")
+    LlmcSseReader { pending: [], offset: 0, max_frame: max_frame }
 
 // Feed bytes, and take the first frame they completed.
 //
@@ -120,7 +120,12 @@ pub fn reader_with(max_frame: Int) -> LlmcSseReader []
 //         Err(_) => println("refused")
 // ```
 pub fn feed(r: LlmcSseReader, data: [u8]) -> Result<LlmcSseStep, LlmcFault> []
-    todo("llm-client-nv.llmcsse.feed")
+    var joined: [u8] = []
+    for i in r.offset..list.len(r.pending)
+        list.push(joined, r.pending[i])
+    for b in data
+        list.push(joined, b)
+    take(LlmcSseReader { pending: joined, offset: 0, max_frame: r.max_frame })
 
 // Take the next frame out of what has already been fed.
 //
@@ -133,7 +138,66 @@ pub fn feed(r: LlmcSseReader, data: [u8]) -> Result<LlmcSseStep, LlmcFault> []
 //         Err(_) => println("refused")
 // ```
 pub fn take(r: LlmcSseReader) -> Result<LlmcSseStep, LlmcFault> []
-    todo("llm-client-nv.llmcsse.take")
+    let buf = r.pending
+    let n = list.len(buf)
+    var frame_start = r.offset
+    var pos = r.offset
+    var event = ""
+    var data = ""
+    var has_data = false
+    var id = ""
+    var retry_ms = 0 - 1
+    while pos < n
+        var e = pos
+        while e < n and buf[e] != 10 and buf[e] != 13
+            e = e + 1
+        if e >= n
+            break
+        var next = e + 1
+        if buf[e] == 13
+            if next >= n
+                break
+            if buf[next] == 10
+                next = next + 1
+        if e == pos
+            if has_data
+                if next - frame_start > r.max_frame
+                    return Err(too_large(r.max_frame))
+                let fr = LlmcSseFrame { event: event, data: data, id: id, retry_ms: retry_ms }
+                return Ok(LlmcSseStep { reader: LlmcSseReader { pending: buf, offset: next, max_frame: r.max_frame },
+                    frame: Some(fr) })
+            frame_start = next
+            event = ""
+            id = ""
+            retry_ms = 0 - 1
+        else
+            let line = text_of(buf, pos, e)
+            let colon = str.index(line, ":") ?? 0 - 1
+            if colon != 0
+                var field = line
+                var value = ""
+                if colon > 0
+                    field = str.slice(line, 0, colon)
+                    value = str.slice(line, colon + 1, str.len(line))
+                    if str.starts_with(value, " ")
+                        value = str.slice(value, 1, str.len(value))
+                if field == "data"
+                    if has_data
+                        data = data + "\n" + value
+                    else
+                        data = value
+                    has_data = true
+                elif field == "event"
+                    event = value
+                elif field == "id"
+                    id = value
+                elif field == "retry"
+                    retry_ms = str.to_int(value) ?? retry_ms
+        pos = next
+    if n - frame_start > r.max_frame
+        return Err(too_large(r.max_frame))
+    Ok(LlmcSseStep { reader: LlmcSseReader { pending: buf, offset: frame_start, max_frame: r.max_frame },
+        frame: None })
 
 // How many fed bytes have not yet made a frame.
 //
@@ -148,7 +212,7 @@ pub fn take(r: LlmcSseReader) -> Result<LlmcSseStep, LlmcFault> []
 //     // : 0
 // ```
 pub fn pending_len(r: LlmcSseReader) -> Int []
-    todo("llm-client-nv.llmcsse.pending_len")
+    list.len(r.pending) - r.offset
 
 // Whether this frame is the OpenAI dialect's `[DONE]` terminator.
 //
@@ -163,7 +227,7 @@ pub fn pending_len(r: LlmcSseReader) -> Int []
 //     llmcsse.is_done(f)
 // ```
 pub fn is_done(f: LlmcSseFrame) -> Bool []
-    todo("llm-client-nv.llmcsse.is_done")
+    str.trim(f.data) == "[DONE]"
 
 // What one frame of a stream said, after its dialect decoded it.
 //
@@ -216,7 +280,8 @@ pub struct LlmcStream
 //     // :
 // ```
 pub fn stream() -> LlmcStream []
-    todo("llm-client-nv.llmcsse.stream")
+    LlmcStream { id: "", model: "", text: "", tool_ids: [], tool_names: [],
+                 tool_args: [], usage: llmcreply.no_usage(), stop: None }
 
 // Fold one event into the accumulator.
 //
@@ -229,7 +294,41 @@ pub fn stream() -> LlmcStream []
 //     // : hello
 // ```
 pub fn apply(s: LlmcStream, e: LlmcEvent) -> LlmcStream []
-    todo("llm-client-nv.llmcsse.apply")
+    match e
+        LlmcEventStart(id, model)           =>
+            LlmcStream { id: id, model: model, text: s.text, tool_ids: s.tool_ids,
+                         tool_names: s.tool_names, tool_args: s.tool_args,
+                         usage: s.usage, stop: s.stop }
+        LlmcEventText(delta)                =>
+            LlmcStream { id: s.id, model: s.model, text: s.text + delta,
+                         tool_ids: s.tool_ids, tool_names: s.tool_names,
+                         tool_args: s.tool_args, usage: s.usage, stop: s.stop }
+        LlmcEventToolStart(index, id, name) =>
+            var ids = padded(s.tool_ids, index + 1)
+            var names = padded(s.tool_names, index + 1)
+            var args = padded(s.tool_args, index + 1)
+            ids[index] = id
+            names[index] = name
+            LlmcStream { id: s.id, model: s.model, text: s.text, tool_ids: ids,
+                         tool_names: names, tool_args: args, usage: s.usage,
+                         stop: s.stop }
+        LlmcEventToolArgs(index, delta)     =>
+            var ids = padded(s.tool_ids, index + 1)
+            var names = padded(s.tool_names, index + 1)
+            var args = padded(s.tool_args, index + 1)
+            args[index] = args[index] + delta
+            LlmcStream { id: s.id, model: s.model, text: s.text, tool_ids: ids,
+                         tool_names: names, tool_args: args, usage: s.usage,
+                         stop: s.stop }
+        LlmcEventUsage(u)                   =>
+            LlmcStream { id: s.id, model: s.model, text: s.text, tool_ids: s.tool_ids,
+                         tool_names: s.tool_names, tool_args: s.tool_args,
+                         usage: merged(s.usage, u), stop: s.stop }
+        LlmcEventStop(stop)                 =>
+            LlmcStream { id: s.id, model: s.model, text: s.text, tool_ids: s.tool_ids,
+                         tool_names: s.tool_names, tool_args: s.tool_args,
+                         usage: s.usage, stop: first_stop(s.stop, stop) }
+        LlmcEventPing                       => s
 
 // Fold a whole frame's events at once.
 //
@@ -240,7 +339,10 @@ pub fn apply(s: LlmcStream, e: LlmcEvent) -> LlmcStream []
 //     llmcsse.apply_all(s, es)
 // ```
 pub fn apply_all(s: LlmcStream, es: [LlmcEvent]) -> LlmcStream []
-    todo("llm-client-nv.llmcsse.apply_all")
+    var acc = s
+    for e in es
+        acc = apply(acc, e)
+    acc
 
 // Whether a terminal event has arrived.
 //
@@ -252,7 +354,9 @@ pub fn apply_all(s: LlmcStream, es: [LlmcEvent]) -> LlmcStream []
 //     // : false
 // ```
 pub fn finished(s: LlmcStream) -> Bool []
-    todo("llm-client-nv.llmcsse.finished")
+    match s.stop
+        Some(_) => true
+        None    => false
 
 // The reply as it stands, whether or not the stream finished.
 //
@@ -268,7 +372,18 @@ pub fn finished(s: LlmcStream) -> Bool []
 //     // :
 // ```
 pub fn partial(s: LlmcStream) -> LlmcReply []
-    todo("llm-client-nv.llmcsse.partial")
+    var calls: [LlmcToolCall] = []
+    for i in 0..list.len(s.tool_ids)
+        // Anthropic numbers every content block, so a tool call after a
+        // text block starts at index 1 and leaves index 0 empty.
+        if s.tool_ids[i] != "" or s.tool_names[i] != "" or s.tool_args[i] != ""
+            list.push(calls, LlmcToolCall { id: s.tool_ids[i], name: s.tool_names[i],
+                                            arguments: s.tool_args[i] })
+    let stop = match s.stop
+        Some(st) => st
+        None     => LlmcStopOther("the stream had not finished")
+    LlmcReply { stop: stop, text: s.text, tool_calls: calls, usage: s.usage,
+                model: s.model, id: s.id }
 
 // The finished reply, or a refusal.
 //
@@ -288,7 +403,9 @@ pub fn partial(s: LlmcStream) -> LlmcReply []
 //     // : truncated
 // ```
 pub fn finish(s: LlmcStream) -> Result<LlmcReply, LlmcFault> []
-    todo("llm-client-nv.llmcsse.finish")
+    if not finished(s)
+        return Err(LlmcStreamTruncated(str.len(s.text)))
+    Ok(partial(s))
 
 // The text delta an event carries, or empty.
 //
@@ -303,4 +420,51 @@ pub fn finish(s: LlmcStream) -> Result<LlmcReply, LlmcFault> []
 //     // : hi
 // ```
 pub fn text_delta(e: LlmcEvent) -> Str []
-    todo("llm-client-nv.llmcsse.text_delta")
+    match e
+        LlmcEventText(delta) => delta
+        _                    => ""
+
+// The refusal for a frame the peer never ended.
+fn too_large(max_frame: Int) -> LlmcFault
+    LlmcMalformedReply("an event frame under ${max_frame} bytes")
+
+// The bytes `lo` up to `hi` as text.
+fn text_of(buf: [u8], lo: Int, hi: Int) -> Str
+    var part: [Int] = []
+    for i in lo..hi
+        list.push(part, buf[i])
+    bytes.byte_list_to_str(part)
+
+// The list grown with empty strings until it holds `n`.
+fn padded(xs: [Str], n: Int) -> [Str]
+    var out = list.clone(xs)
+    while list.len(out) < n
+        list.push(out, "")
+    out
+
+// A stream's usage with the newer report laid over the older: a field
+// the newer one left at zero keeps its earlier value, because
+// Anthropic reports the input count at the start and the output count
+// at the end.
+fn merged(old: LlmcUsage, new: LlmcUsage) -> LlmcUsage
+    LlmcUsage { input_tokens: later(old.input_tokens, new.input_tokens),
+                output_tokens: later(old.output_tokens, new.output_tokens),
+                cached_input_tokens: later(old.cached_input_tokens, new.cached_input_tokens),
+                reasoning_tokens: later(old.reasoning_tokens, new.reasoning_tokens) }
+
+fn later(old: Int, new: Int) -> Int
+    if new > 0
+        new
+    else
+        old
+
+// The stop already recorded, or this one.
+//
+// The first stop wins: Anthropic names the reason on `message_delta`
+// and then ends the stream with a bare `message_stop`, which the
+// dialect reads as an end of turn.  The later one must not turn a
+// `max_tokens` into an end.
+fn first_stop(have: ?LlmcStop, stop: LlmcStop) -> ?LlmcStop
+    match have
+        Some(_) => have
+        None    => Some(stop)

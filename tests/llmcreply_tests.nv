@@ -1,9 +1,5 @@
 // llmcreply_tests.nv — the two ways a reply is not what it looks like.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented: llm-client-nv.<module>.<fn>`.
-// That is the expected result until the bodies land.
-//
 // NO SOCKET IN THIS FILE, AND THAT IS THE PACKAGE'S CLAIM WORKING.
 // Both dialect modules and this one are `core`-shaped: every row is
 // `[]`, so a provider's whole response body is a string a test writes
@@ -148,14 +144,18 @@ fn test_usage_separates_the_cached_input_from_the_total() [io]
     match llmcanthro.decode_reply(body)
         Err(_) => test.assert(false)
         Ok(r)  =>
+            // Anthropic's `input_tokens` counts only the tokens that
+            // were NOT read from the cache; the whole input is the sum
+            // of it and the two cache counts (the prompt-caching page's
+            // own formula), so 1200 + 1024.
             test.case("the input count is the whole input")
-            test.assert(r.usage.input_tokens == 1200)
+            test.assert(r.usage.input_tokens == 2224)
 
             test.case("and the cached part is named beside it")
             test.assert(r.usage.cached_input_tokens == 1024)
 
             test.case("so the total is not a sum of the two")
-            test.assert(llmcreply.total_tokens(r.usage) == 1210)
+            test.assert(llmcreply.total_tokens(r.usage) == 2234)
 
 @test
 fn test_a_filtered_reply_is_a_reply_and_not_an_error() [io]

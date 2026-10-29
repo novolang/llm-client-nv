@@ -10,9 +10,9 @@ hash = "4265f9e51f7897955af1809e2ccf5a75f22c217b18f7d77bca9919d5d2a5b45c"
 [prompt-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "d68bf926ed51256f87b0cd7bbd5a433ff2290e30a93c2b8c32be4fb1f107ffac"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "306c3c2f1d1496a8c7a44a3525b9d6280613f82c553c3f6654e893190cbef762"
 
 [schema-nv]
 source = "registry"
@@ -24,6 +24,13 @@ hash = "004aca32b0b7836108dde2e439500a43adc98764111a999c72cb2e92060b0a99"
 [tokenizers-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.0.2"
-version = "0.0.2"
-hash = "c1471eb68aa5fe9bab91d4622a7692b03247a8bbac3a8679490844e411f97689"
+req = "^0.1.0"
+version = "0.1.0"
+hash = "b25a7fba00ffe9e28a35b969ed22f1a11c3dfa2e643f296c090568ec7226217d"
+
+[unicode-nv]
+source = "registry"
+url = "https://registry.novo-lang.org"
+req = "^0.1.4"
+version = "0.1.4"
+hash = "bc839c4dec2e823dd8162f00bfa56cdcc1a894c839129eef2b069d3cf73d5ea7"

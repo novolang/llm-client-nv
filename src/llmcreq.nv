@@ -1,8 +1,6 @@
 // llmcreq.nv — the request, the provider it goes to, and what it will
 // cost before it goes.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.  A request is a value, a provider is a value, and
 // counting a request's tokens is arithmetic over a vocabulary the
 // caller already loaded.
@@ -36,7 +34,9 @@
 
 use std.json
 use std.list
+use std.str
 use promptmsg
+use tokmodel
 use llmcfault
 
 // Which wire dialect a provider speaks.
@@ -67,7 +67,9 @@ pub enum LlmcDialect
 //     // : openai
 // ```
 pub fn dialect_name(d: LlmcDialect) -> Str []
-    todo("llm-client-nv.llmcreq.dialect_name")
+    match d
+        LlmcOpenAiChat        => "openai"
+        LlmcAnthropicMessages => "anthropic"
 
 // The dialect a name selects, or None for a name this package does
 // not speak.
@@ -81,7 +83,12 @@ pub fn dialect_name(d: LlmcDialect) -> Str []
 //         None    => println("unknown")
 // ```
 pub fn dialect_of_name(name: Str) -> ?LlmcDialect []
-    todo("llm-client-nv.llmcreq.dialect_of_name")
+    if name == "openai"
+        Some(LlmcOpenAiChat)
+    elif name == "anthropic"
+        Some(LlmcAnthropicMessages)
+    else
+        None
 
 // Where a request goes and what it carries on the way.
 //
@@ -121,7 +128,12 @@ pub struct LlmcProvider
 //     // : https://api.openai.com
 // ```
 pub fn openai(api_key: Str) -> LlmcProvider []
-    todo("llm-client-nv.llmcreq.openai")
+    LlmcProvider { dialect: LlmcOpenAiChat,
+        base_url: "https://api.openai.com",
+        api_key: api_key,
+        api_version: "",
+        organization: "",
+        extra_headers: [] }
 
 // Anthropic's own endpoint, with a key and the version this package
 // was written against.
@@ -133,7 +145,12 @@ pub fn openai(api_key: Str) -> LlmcProvider []
 //     println(llmcreq.anthropic("sk-ant-test").api_version)
 // ```
 pub fn anthropic(api_key: Str) -> LlmcProvider []
-    todo("llm-client-nv.llmcreq.anthropic")
+    LlmcProvider { dialect: LlmcAnthropicMessages,
+        base_url: "https://api.anthropic.com",
+        api_key: api_key,
+        api_version: "2023-06-01",
+        organization: "",
+        extra_headers: [] }
 
 // Any server that speaks the OpenAI chat dialect: llama.cpp's server,
 // vLLM, LM Studio, an mlserve instance, Ollama's `/v1` endpoint, a
@@ -150,7 +167,12 @@ pub fn anthropic(api_key: Str) -> LlmcProvider []
 //     // : false
 // ```
 pub fn compatible(base_url: Str, api_key: Str) -> LlmcProvider []
-    todo("llm-client-nv.llmcreq.compatible")
+    LlmcProvider { dialect: LlmcOpenAiChat,
+        base_url: base_url,
+        api_key: api_key,
+        api_version: "",
+        organization: "",
+        extra_headers: [] }
 
 // The same provider pointed at another origin.
 //
@@ -163,7 +185,12 @@ pub fn compatible(base_url: Str, api_key: Str) -> LlmcProvider []
 //     // : https://gw.example.com
 // ```
 pub fn with_base_url(p: LlmcProvider, base_url: Str) -> LlmcProvider []
-    todo("llm-client-nv.llmcreq.with_base_url")
+    LlmcProvider { dialect: p.dialect,
+        base_url: base_url,
+        api_key: p.api_key,
+        api_version: p.api_version,
+        organization: p.organization,
+        extra_headers: p.extra_headers }
 
 // The same provider with one more header on every request.
 //
@@ -176,7 +203,14 @@ pub fn with_base_url(p: LlmcProvider, base_url: Str) -> LlmcProvider []
 //     // : 1
 // ```
 pub fn with_header(p: LlmcProvider, name: Str, value: Str) -> LlmcProvider []
-    todo("llm-client-nv.llmcreq.with_header")
+    var hs = list.clone(p.extra_headers)
+    list.push(hs, "${name}: ${value}")
+    LlmcProvider { dialect: p.dialect,
+        base_url: p.base_url,
+        api_key: p.api_key,
+        api_version: p.api_version,
+        organization: p.organization,
+        extra_headers: hs }
 
 // The same provider with another API version pinned.
 //
@@ -189,7 +223,12 @@ pub fn with_header(p: LlmcProvider, name: Str, value: Str) -> LlmcProvider []
 //     // : 2023-06-01
 // ```
 pub fn with_api_version(p: LlmcProvider, version: Str) -> LlmcProvider []
-    todo("llm-client-nv.llmcreq.with_api_version")
+    LlmcProvider { dialect: p.dialect,
+        base_url: p.base_url,
+        api_key: p.api_key,
+        api_version: version,
+        organization: p.organization,
+        extra_headers: p.extra_headers }
 
 // The origin, as a plain accessor for a caller that does not want to
 // reach into the struct.
@@ -202,7 +241,7 @@ pub fn with_api_version(p: LlmcProvider, version: Str) -> LlmcProvider []
 //     // : http://localhost:11434
 // ```
 pub fn provider_base_url(p: LlmcProvider) -> Str []
-    todo("llm-client-nv.llmcreq.provider_base_url")
+    p.base_url
 
 // Whether a key was supplied.
 //
@@ -219,7 +258,7 @@ pub fn provider_base_url(p: LlmcProvider) -> Str []
 //     // : true
 // ```
 pub fn key_is_set(p: LlmcProvider) -> Bool []
-    todo("llm-client-nv.llmcreq.key_is_set")
+    p.api_key != ""
 
 // The provider as one line with the key REPLACED by its last four
 // characters.
@@ -236,7 +275,13 @@ pub fn key_is_set(p: LlmcProvider) -> Bool []
 //     // : openai https://api.openai.com key=…1234
 // ```
 pub fn redacted(p: LlmcProvider) -> Str []
-    todo("llm-client-nv.llmcreq.redacted")
+    let n = str.len(p.api_key)
+    var key = "none"
+    if n > 8
+        key = "…" + str.slice(p.api_key, n - 4, n)
+    elif n > 0
+        key = "****"
+    "${dialect_name(p.dialect)} ${p.base_url} key=${key}"
 
 // The path a chat request is posted to, appended to `base_url`.
 //
@@ -253,7 +298,9 @@ pub fn redacted(p: LlmcProvider) -> Str []
 //     // : /v1/chat/completions
 // ```
 pub fn chat_path(p: LlmcProvider) -> Str []
-    todo("llm-client-nv.llmcreq.chat_path")
+    match p.dialect
+        LlmcOpenAiChat        => "/v1/chat/completions"
+        LlmcAnthropicMessages => "/v1/messages"
 
 // Every header this provider puts on every request, in order.
 //
@@ -269,7 +316,19 @@ pub fn chat_path(p: LlmcProvider) -> Str []
 //     println("${list.len(llmcreq.auth_headers(llmcreq.anthropic("sk-ant-test")))}")
 // ```
 pub fn auth_headers(p: LlmcProvider) -> [Str] []
-    todo("llm-client-nv.llmcreq.auth_headers")
+    var hs: [Str] = []
+    if key_is_set(p)
+        match p.dialect
+            LlmcOpenAiChat        => list.push(hs, "Authorization: Bearer ${p.api_key}")
+            LlmcAnthropicMessages => list.push(hs, "x-api-key: ${p.api_key}")
+    if p.dialect == LlmcAnthropicMessages and p.api_version != ""
+        list.push(hs, "anthropic-version: ${p.api_version}")
+    list.push(hs, "Content-Type: application/json")
+    if p.organization != ""
+        list.push(hs, "OpenAI-Organization: ${p.organization}")
+    for h in p.extra_headers
+        list.push(hs, h)
+    hs
 
 // One tool the model may ask for.
 //
@@ -293,7 +352,7 @@ pub struct LlmcToolDef
 //     // : now
 // ```
 pub fn tool(name: Str, description: Str, parameters: JsonValueH) -> LlmcToolDef []
-    todo("llm-client-nv.llmcreq.tool")
+    LlmcToolDef { name: name, description: description, parameters: parameters }
 
 // Which tool, if any, the model must call this turn.
 pub enum LlmcToolChoice
@@ -355,7 +414,8 @@ pub struct LlmcParams
 //     // : -1
 // ```
 pub fn params() -> LlmcParams []
-    todo("llm-client-nv.llmcreq.params")
+    LlmcParams { max_tokens: 0 - 1, temperature: 0.0 - 1.0, top_p: 0.0 - 1.0,
+                 stop: [], seed: 0 - 1 }
 
 // The same parameters with a reply cap.
 //
@@ -367,7 +427,8 @@ pub fn params() -> LlmcParams []
 //     // : 1024
 // ```
 pub fn with_max_tokens(p: LlmcParams, n: Int) -> LlmcParams []
-    todo("llm-client-nv.llmcreq.with_max_tokens")
+    LlmcParams { max_tokens: n, temperature: p.temperature, top_p: p.top_p,
+                 stop: p.stop, seed: p.seed }
 
 // The same parameters with a sampling temperature.
 //
@@ -378,7 +439,8 @@ pub fn with_max_tokens(p: LlmcParams, n: Int) -> LlmcParams []
 //     println("${llmcreq.with_temperature(llmcreq.params(), 0.0).temperature}")
 // ```
 pub fn with_temperature(p: LlmcParams, t: Float) -> LlmcParams []
-    todo("llm-client-nv.llmcreq.with_temperature")
+    LlmcParams { max_tokens: p.max_tokens, temperature: t, top_p: p.top_p,
+                 stop: p.stop, seed: p.seed }
 
 // The same parameters with nucleus sampling.
 //
@@ -389,7 +451,8 @@ pub fn with_temperature(p: LlmcParams, t: Float) -> LlmcParams []
 //     println("${llmcreq.with_top_p(llmcreq.params(), 0.9).top_p}")
 // ```
 pub fn with_top_p(p: LlmcParams, v: Float) -> LlmcParams []
-    todo("llm-client-nv.llmcreq.with_top_p")
+    LlmcParams { max_tokens: p.max_tokens, temperature: p.temperature, top_p: v,
+                 stop: p.stop, seed: p.seed }
 
 // The same parameters with stop sequences.
 //
@@ -401,7 +464,8 @@ pub fn with_top_p(p: LlmcParams, v: Float) -> LlmcParams []
 //     // : 1
 // ```
 pub fn with_stop(p: LlmcParams, stop: [Str]) -> LlmcParams []
-    todo("llm-client-nv.llmcreq.with_stop")
+    LlmcParams { max_tokens: p.max_tokens, temperature: p.temperature,
+                 top_p: p.top_p, stop: stop, seed: p.seed }
 
 // The same parameters with OpenAI's seed.
 //
@@ -413,7 +477,8 @@ pub fn with_stop(p: LlmcParams, stop: [Str]) -> LlmcParams []
 //     // : 7
 // ```
 pub fn with_seed(p: LlmcParams, seed: Int) -> LlmcParams []
-    todo("llm-client-nv.llmcreq.with_seed")
+    LlmcParams { max_tokens: p.max_tokens, temperature: p.temperature,
+                 top_p: p.top_p, stop: p.stop, seed: seed }
 
 // One request, before it has been rendered into either dialect.
 //
@@ -446,7 +511,8 @@ pub struct LlmcRequest
 //     // : gpt-4o-mini
 // ```
 pub fn request(model: Str, c: PromptConvo) -> LlmcRequest []
-    todo("llm-client-nv.llmcreq.request")
+    LlmcRequest { model: model, convo: c, tools: [], tool_choice: LlmcToolAuto,
+                  format: LlmcFormatText, params: params(), stream: false }
 
 // The same request offering a tool set.
 //
@@ -462,7 +528,9 @@ pub fn request(model: Str, c: PromptConvo) -> LlmcRequest []
 //     // : 1
 // ```
 pub fn with_tools(r: LlmcRequest, tools: [LlmcToolDef]) -> LlmcRequest []
-    todo("llm-client-nv.llmcreq.with_tools")
+    LlmcRequest { model: r.model, convo: r.convo, tools: tools,
+                  tool_choice: r.tool_choice, format: r.format, params: r.params,
+                  stream: r.stream }
 
 // The same request constraining which tool the model may call.
 //
@@ -478,7 +546,9 @@ pub fn with_tools(r: LlmcRequest, tools: [LlmcToolDef]) -> LlmcRequest []
 //     // : 0
 // ```
 pub fn with_tool_choice(r: LlmcRequest, choice: LlmcToolChoice) -> LlmcRequest []
-    todo("llm-client-nv.llmcreq.with_tool_choice")
+    LlmcRequest { model: r.model, convo: r.convo, tools: r.tools,
+                  tool_choice: choice, format: r.format, params: r.params,
+                  stream: r.stream }
 
 // The same request asking for a shaped reply.
 //
@@ -494,7 +564,9 @@ pub fn with_tool_choice(r: LlmcRequest, choice: LlmcToolChoice) -> LlmcRequest [
 //     // : gpt-4o-mini
 // ```
 pub fn with_format(r: LlmcRequest, f: LlmcFormat) -> LlmcRequest []
-    todo("llm-client-nv.llmcreq.with_format")
+    LlmcRequest { model: r.model, convo: r.convo, tools: r.tools,
+                  tool_choice: r.tool_choice, format: f, params: r.params,
+                  stream: r.stream }
 
 // The same request with sampling parameters.
 //
@@ -510,7 +582,9 @@ pub fn with_format(r: LlmcRequest, f: LlmcFormat) -> LlmcRequest []
 //     // : 512
 // ```
 pub fn with_params(r: LlmcRequest, p: LlmcParams) -> LlmcRequest []
-    todo("llm-client-nv.llmcreq.with_params")
+    LlmcRequest { model: r.model, convo: r.convo, tools: r.tools,
+                  tool_choice: r.tool_choice, format: r.format, params: p,
+                  stream: r.stream }
 
 // The same request, streamed.
 //
@@ -525,7 +599,9 @@ pub fn with_params(r: LlmcRequest, p: LlmcParams) -> LlmcRequest []
 //     // : true
 // ```
 pub fn streaming(r: LlmcRequest) -> LlmcRequest []
-    todo("llm-client-nv.llmcreq.streaming")
+    LlmcRequest { model: r.model, convo: r.convo, tools: r.tools,
+                  tool_choice: r.tool_choice, format: r.format, params: r.params,
+                  stream: true }
 
 // Whether this request can be spoken in this dialect at all.
 //
@@ -566,7 +642,29 @@ pub fn streaming(r: LlmcRequest) -> LlmcRequest []
 //         Err(_) => println("refused: anthropic requires max_tokens")
 // ```
 pub fn check(r: LlmcRequest, d: LlmcDialect) -> Result<Int, LlmcFault> []
-    todo("llm-client-nv.llmcreq.check")
+    if r.model == ""
+        return Err(LlmcBadEncoding("the request names no model"))
+    let n = match promptmsg.check(r.convo)
+        Ok(count) => count
+        Err(f)    =>
+            return Err(LlmcBadEncoding(f.message()))
+    if r.params.max_tokens == 0
+        return Err(LlmcBadEncoding("max_tokens is zero, which asks for an empty reply"))
+    if d == LlmcAnthropicMessages
+        if r.params.max_tokens < 0
+            return Err(LlmcBadEncoding("max_tokens is required by the anthropic dialect and the request has none"))
+        if r.params.seed >= 0
+            return Err(LlmcUnsupported("seed", "anthropic"))
+        match r.format
+            LlmcFormatJson            =>
+                return Err(LlmcUnsupported("a JSON response format with no schema", "anthropic"))
+            LlmcFormatSchema(_, _, _) =>
+                if list.len(r.tools) > 0
+                    return Err(LlmcUnsupported("a response schema beside tools", "anthropic"))
+            LlmcFormatText            => 0
+    check_tools(r)!
+    check_tool_results(r.convo)!
+    Ok(n)
 
 // Whether a tool name is one both providers accept.
 //
@@ -580,7 +678,15 @@ pub fn check(r: LlmcRequest, d: LlmcDialect) -> Result<Int, LlmcFault> []
 //     // : true
 // ```
 pub fn is_tool_name(name: Str) -> Bool []
-    todo("llm-client-nv.llmcreq.is_tool_name")
+    let n = str.len(name)
+    if n < 1 or n > 64
+        return false
+    for i in 0..n
+        let b = str.byte_at_or(name, i, 0)
+        let ok = b >= 48 and b <= 57 or b >= 65 and b <= 90 or b >= 97 and b <= 122 or b == 95 or b == 45
+        if not ok
+            return false
+    true
 
 // What the rendered request will cost in tokens, counted with the
 // caller's own tokenizer.
@@ -610,7 +716,17 @@ pub fn is_tool_name(name: Str) -> Bool []
 //                                               promptmsg.empty_convo()))
 // ```
 pub fn request_tokens(m: TokModel, r: LlmcRequest) -> Int []
-    todo("llm-client-nv.llmcreq.request_tokens")
+    var total = 3 + tools_tokens(m, r.tools)
+    for msg in r.convo.messages
+        total = total + 4 + tokmodel.token_count(m, msg.text) + tokmodel.token_count(m, msg.name)
+    match r.format
+        LlmcFormatSchema(name, schema, _) =>
+            total = total + 8 + tokmodel.token_count(m, name)
+                    + tokmodel.token_count(m, json.stringify(schema))
+        LlmcFormatJson                    =>
+            total = total + 4
+        LlmcFormatText                    => 0
+    total
 
 // What the tool definitions alone cost.
 //
@@ -626,7 +742,12 @@ pub fn request_tokens(m: TokModel, r: LlmcRequest) -> Int []
 //     llmcreq.tools_tokens(m, ts)
 // ```
 pub fn tools_tokens(m: TokModel, tools: [LlmcToolDef]) -> Int []
-    todo("llm-client-nv.llmcreq.tools_tokens")
+    var total = 0
+    for t in tools
+        total = total + 7 + tokmodel.token_count(m, t.name)
+                + tokmodel.token_count(m, t.description)
+                + tokmodel.token_count(m, json.stringify(t.parameters))
+    total
 
 // Refuse a request that will not fit, locally, before it is sent.
 //
@@ -645,4 +766,87 @@ pub fn tools_tokens(m: TokModel, tools: [LlmcToolDef]) -> Int []
 //         Err(_) => false
 // ```
 pub fn check_budget(m: TokModel, r: LlmcRequest, limit: Int) -> Result<Int, LlmcFault> []
-    todo("llm-client-nv.llmcreq.check_budget")
+    let wanted = request_tokens(m, r)
+    if wanted > limit
+        Err(LlmcBudgetExceeded(wanted, limit))
+    else
+        Ok(wanted)
+
+// The tool set against the choice: names the providers accept, no name
+// twice, and a forced choice that has something to force.
+fn check_tools(r: LlmcRequest) -> Result<Int, LlmcFault>
+    var seen: [Str] = []
+    for t in r.tools
+        if not is_tool_name(t.name)
+            return Err(LlmcBadEncoding("the tool name \"${t.name}\" is not 1 to 64 letters, digits, underscores or hyphens"))
+        if list.contains(seen, t.name)
+            return Err(LlmcBadEncoding("two tools are named ${t.name}"))
+        list.push(seen, t.name)
+    match r.tool_choice
+        LlmcToolRequired    =>
+            if list.len(r.tools) == 0
+                return Err(LlmcBadEncoding("a tool is required and none is offered"))
+        LlmcToolNamed(name) =>
+            if not list.contains(seen, name)
+                return Err(LlmcBadEncoding("the tool ${name} is forced and is not offered"))
+        _                   => 0
+    match r.format
+        LlmcFormatSchema(name, _, _) =>
+            if not is_tool_name(name)
+                return Err(LlmcBadEncoding("the schema name \"${name}\" is not 1 to 64 letters, digits, underscores or hyphens"))
+        _                            => 0
+    Ok(list.len(r.tools))
+
+// The conversation's tool calls against its tool results.
+//
+// An assistant message that carries a tool name and a call id IS a
+// tool call (`llmcreply.to_messages` writes them).  Every result must
+// answer a call made before it, and every call must have its result
+// after it: the first is a 400 from Anthropic, the second a 400 from
+// Anthropic and a model answering as though the tool returned nothing
+// from the other dialect.
+fn check_tool_results(c: PromptConvo) -> Result<Int, LlmcFault>
+    let ms = c.messages
+    for i in 0..list.len(ms)
+        let m = ms[i]
+        if m.role == PromptTool
+            if m.call_id == ""
+                return Err(LlmcBadEncoding("a tool result at position ${i} names no call id"))
+            if not has_call_before(ms, i, m.call_id)
+                return Err(LlmcBadEncoding("the tool result at position ${i} answers call id ${m.call_id}, which no assistant turn made"))
+        elif is_call(m)
+            if not has_result_after(ms, i, m.call_id)
+                return Err(LlmcBadEncoding("the tool call ${m.call_id} at position ${i} has no result after it"))
+    Ok(list.len(ms))
+
+// Whether a message is an assistant turn's tool call.
+pub fn is_call(m: PromptMessage) -> Bool
+    m.role == PromptAssistant and m.call_id != "" and m.name != ""
+
+fn has_call_before(ms: [PromptMessage], upto: Int, id: Str) -> Bool
+    for i in 0..upto
+        if is_call(ms[i]) and ms[i].call_id == id
+            return true
+    false
+
+fn has_result_after(ms: [PromptMessage], from: Int, id: Str) -> Bool
+    for i in from + 1..list.len(ms)
+        if ms[i].role == PromptTool and ms[i].call_id == id
+            return true
+    false
+
+// Whether a model name carries a provider prefix.
+//
+// `openai:gpt-4o-mini` is the form `std.llm` takes and no endpoint
+// accepts.  A colon is not enough to say so: Ollama's own names are
+// `llama3:8b`, a tag.  So the prefix has to be a provider this package
+// knows by name.
+pub fn is_qualified_model(name: Str) -> Bool
+    match str.index(name, ":")
+        None     => false
+        Some(at) =>
+            let prefix = str.lower(str.slice(name, 0, at))
+            list.contains(["openai", "anthropic", "groq", "ollama", "together", "google",
+                           "mistral", "xai", "deepseek", "azure", "bedrock", "vertex",
+                           "fireworks", "openrouter"],
+                           prefix)

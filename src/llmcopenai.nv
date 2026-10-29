@@ -1,7 +1,5 @@
 // llmcopenai.nv — the OpenAI-compatible chat dialect.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // THIS MODULE IS `core`-SHAPED INSIDE A `host` PACKAGE and every row
 // in it is `[]`.  A dialect is a function from a request value to a
 // JSON value and from a JSON value back to a reply; nothing here
@@ -44,6 +42,8 @@
 
 use std.json
 use std.list
+use std.str
+use promptmsg
 use llmcfault
 use llmcreq
 use llmcreply
@@ -78,7 +78,37 @@ pub const LLMC_OPENAI_DONE = "[DONE]"
 //         Err(_) => false
 // ```
 pub fn encode_request(p: LlmcProvider, r: LlmcRequest) -> Result<JsonValueH, LlmcFault> []
-    todo("llm-client-nv.llmcopenai.encode_request")
+    llmcreq.check(r, LlmcOpenAiChat)!
+    var kv: [(Str, JsonValueH)] = []
+    list.push(kv, ("model", json.string(r.model)))
+    list.push(kv, ("messages", encode_messages(r.convo)!))
+    if list.len(r.tools) > 0
+        var tools: [JsonValueH] = []
+        for t in r.tools
+            list.push(tools, encode_tool(t))
+        list.push(kv, ("tools", json.array(tools)))
+        if r.tool_choice != LlmcToolAuto
+            list.push(kv, ("tool_choice", encode_tool_choice(r.tool_choice)))
+    match r.format
+        LlmcFormatText => 0
+        _              => list.push(kv, ("response_format", encode_format(r.format)!))
+    if r.params.max_tokens > 0
+        list.push(kv, ("max_tokens", json.int(r.params.max_tokens)))
+    if r.params.temperature >= 0.0
+        list.push(kv, ("temperature", json.float(r.params.temperature)))
+    if r.params.top_p >= 0.0
+        list.push(kv, ("top_p", json.float(r.params.top_p)))
+    if list.len(r.params.stop) > 0
+        var stops: [JsonValueH] = []
+        for s in r.params.stop
+            list.push(stops, json.string(s))
+        list.push(kv, ("stop", json.array(stops)))
+    if r.params.seed >= 0
+        list.push(kv, ("seed", json.int(r.params.seed)))
+    if r.stream
+        list.push(kv, ("stream", json.bool(true)))
+        list.push(kv, ("stream_options", json.object([("include_usage", json.bool(true))])))
+    Ok(json.object(kv))
 
 // The same body, serialised.
 //
@@ -92,7 +122,7 @@ pub fn encode_request(p: LlmcProvider, r: LlmcRequest) -> Result<JsonValueH, Llm
 //         Err(_) => ""
 // ```
 pub fn encode_body(p: LlmcProvider, r: LlmcRequest) -> Result<Str, LlmcFault> []
-    todo("llm-client-nv.llmcopenai.encode_body")
+    Ok(json.stringify(encode_request(p, r)!))
 
 // One prompt-nv message as this dialect's message object.
 //
@@ -110,7 +140,14 @@ pub fn encode_body(p: LlmcProvider, r: LlmcRequest) -> Result<Str, LlmcFault> []
 //         Err(_) => false
 // ```
 pub fn encode_message(m: PromptMessage) -> Result<JsonValueH, LlmcFault> []
-    todo("llm-client-nv.llmcopenai.encode_message")
+    if m.role == PromptTool
+        if m.call_id == ""
+            return Err(LlmcBadEncoding("a tool result names no call id"))
+        return Ok(tool_result_message(m.call_id, m.text))
+    if llmcreq.is_call(m)
+        return Ok(assistant_with_calls("", [m]))
+    Ok(json.object([("role", json.string(promptmsg.role_name(m.role))),
+                    ("content", json.string(m.text))]))
 
 // The whole conversation as this dialect's `messages` array.
 //
@@ -128,7 +165,28 @@ pub fn encode_message(m: PromptMessage) -> Result<JsonValueH, LlmcFault> []
 //         Err(_) => false
 // ```
 pub fn encode_messages(c: PromptConvo) -> Result<JsonValueH, LlmcFault> []
-    todo("llm-client-nv.llmcopenai.encode_messages")
+    var out: [JsonValueH] = []
+    let ms = c.messages
+    var i = 0
+    while i < list.len(ms)
+        let m = ms[i]
+        var j = i
+        if not llmcreq.is_call(m)
+            j = i + 1
+        var calls: [PromptMessage] = []
+        while m.role == PromptAssistant and j < list.len(ms) and llmcreq.is_call(ms[j])
+            list.push(calls, ms[j])
+            j = j + 1
+        if list.len(calls) > 0
+            var text = ""
+            if not llmcreq.is_call(m)
+                text = m.text
+            list.push(out, assistant_with_calls(text, calls))
+            i = j
+        else
+            list.push(out, encode_message(m)!)
+            i = i + 1
+    Ok(json.array(out))
 
 // One tool definition as `{"type": "function", "function": {…}}`.
 //
@@ -143,7 +201,10 @@ pub fn encode_messages(c: PromptConvo) -> Result<JsonValueH, LlmcFault> []
 //     // : object
 // ```
 pub fn encode_tool(t: LlmcToolDef) -> JsonValueH []
-    todo("llm-client-nv.llmcopenai.encode_tool")
+    json.object([("type", json.string("function")),
+                 ("function", json.object([("name", json.string(t.name)),
+                                           ("description", json.string(t.description)),
+                                           ("parameters", t.parameters)]))])
 
 // A tool choice as this dialect's `tool_choice`.
 //
@@ -160,7 +221,13 @@ pub fn encode_tool(t: LlmcToolDef) -> JsonValueH []
 //     // : string
 // ```
 pub fn encode_tool_choice(c: LlmcToolChoice) -> JsonValueH []
-    todo("llm-client-nv.llmcopenai.encode_tool_choice")
+    match c
+        LlmcToolAuto        => json.string("auto")
+        LlmcToolNone        => json.string("none")
+        LlmcToolRequired    => json.string("required")
+        LlmcToolNamed(name) =>
+            json.object([("type", json.string("function")),
+                         ("function", json.object([("name", json.string(name))]))])
 
 // A response format as this dialect's `response_format`.
 //
@@ -185,7 +252,14 @@ pub fn encode_tool_choice(c: LlmcToolChoice) -> JsonValueH []
 //         Err(_) => false
 // ```
 pub fn encode_format(f: LlmcFormat) -> Result<JsonValueH, LlmcFault> []
-    todo("llm-client-nv.llmcopenai.encode_format")
+    match f
+        LlmcFormatText                         => Ok(json.object([("type", json.string("text"))]))
+        LlmcFormatJson                         => Ok(json.object([("type", json.string("json_object"))]))
+        LlmcFormatSchema(name, schema, strict) =>
+            Ok(json.object([("type", json.string("json_schema")),
+                            ("json_schema", json.object([("name", json.string(name)),
+                                                         ("schema", schema),
+                                                         ("strict", json.bool(strict))]))]))
 
 // The assistant turn as this dialect writes it, with the tool calls
 // intact.
@@ -204,7 +278,11 @@ pub fn encode_format(f: LlmcFormat) -> Result<JsonValueH, LlmcFault> []
 //     // : object
 // ```
 pub fn assistant_turn(r: LlmcReply) -> JsonValueH []
-    todo("llm-client-nv.llmcopenai.assistant_turn")
+    var calls: [PromptMessage] = []
+    for c in r.tool_calls
+        list.push(calls, PromptMessage { role: PromptAssistant, text: c.arguments,
+                                         name: c.name, call_id: c.id })
+    assistant_with_calls(r.text, calls)
 
 // One tool result as this dialect's message.
 //
@@ -221,7 +299,8 @@ pub fn assistant_turn(r: LlmcReply) -> JsonValueH []
 //     // : object
 // ```
 pub fn tool_result_message(call_id: Str, content: Str) -> JsonValueH []
-    todo("llm-client-nv.llmcopenai.tool_result_message")
+    json.object([("role", json.string("tool")), ("tool_call_id", json.string(call_id)),
+                 ("content", json.string(content))])
 
 // A buffered 200 body as a reply.
 //
@@ -234,7 +313,9 @@ pub fn tool_result_message(call_id: Str, content: Str) -> JsonValueH []
 //         Err(_) => false
 // ```
 pub fn decode_reply(body: Str) -> Result<LlmcReply, LlmcFault> []
-    todo("llm-client-nv.llmcopenai.decode_reply")
+    match json.parse(body)
+        Some(v) => decode_value(v)
+        None    => Err(LlmcMalformedReply("body as JSON"))
 
 // The same, from a value a caller already parsed.
 //
@@ -248,7 +329,28 @@ pub fn decode_reply(body: Str) -> Result<LlmcReply, LlmcFault> []
 //         Err(_) => false
 // ```
 pub fn decode_value(v: JsonValueH) -> Result<LlmcReply, LlmcFault> []
-    todo("llm-client-nv.llmcopenai.decode_value")
+    let choices = json.get_list(v, "choices") ?? []
+    if list.len(choices) == 0
+        return Err(LlmcMalformedReply("choices"))
+    let first = choices[0]
+    let message = match json.get(first, "message")
+        Some(m) => m
+        None    =>
+            return Err(LlmcMalformedReply("choices[0].message"))
+    var calls: [LlmcToolCall] = []
+    for tc in json.get_list(message, "tool_calls") ?? []
+        let fn_value = json.get(tc, "function") ?? json.null()
+        list.push(calls, LlmcToolCall { id: json.get_str(tc, "id") ?? "",
+                                        name: json.get_str(fn_value, "name") ?? "",
+                                        arguments: arguments_text(fn_value) })
+    var stop = llmcreply.stop_of_openai(json.get_str(first, "finish_reason") ?? "")
+    if list.len(calls) > 0 and stop == LlmcStopEnd
+        stop = LlmcStopToolUse
+    Ok(LlmcReply { stop: stop, text: json.get_str(message, "content") ?? "",
+                   tool_calls: calls,
+                   usage: decode_usage(json.get(v, "usage") ?? json.null()),
+                   model: json.get_str(v, "model") ?? "",
+                   id: json.get_str(v, "id") ?? "" })
 
 // The `usage` object, or every field zero when there was none.
 //
@@ -264,7 +366,12 @@ pub fn decode_value(v: JsonValueH) -> Result<LlmcReply, LlmcFault> []
 //     // : 0
 // ```
 pub fn decode_usage(v: JsonValueH) -> LlmcUsage []
-    todo("llm-client-nv.llmcopenai.decode_usage")
+    let details = json.get(v, "prompt_tokens_details") ?? json.null()
+    let out_details = json.get(v, "completion_tokens_details") ?? json.null()
+    LlmcUsage { input_tokens: json.get_int(v, "prompt_tokens") ?? 0,
+                output_tokens: json.get_int(v, "completion_tokens") ?? 0,
+                cached_input_tokens: json.get_int(details, "cached_tokens") ?? 0,
+                reasoning_tokens: json.get_int(out_details, "reasoning_tokens") ?? 0 }
 
 // A non-2xx status and its body as a fault.
 //
@@ -282,7 +389,19 @@ pub fn decode_usage(v: JsonValueH) -> LlmcUsage []
 //     // : true
 // ```
 pub fn decode_error(status: Int, body: Str) -> LlmcFault []
-    todo("llm-client-nv.llmcopenai.decode_error")
+    var message = str.trim(body)
+    var code = ""
+    match json.parse(body)
+        Some(v) =>
+            let err = json.get(v, "error") ?? json.null()
+            message = json.get_str(err, "message") ?? message
+            code = json.get_str(err, "code") ?? json.get_str(err, "type") ?? ""
+        None    => 0
+    if message == ""
+        message = "the response had no body"
+    match llmcfault.of_status(status, message)
+        LlmcBadRequest(s, _, m) => LlmcBadRequest(s, code, m)
+        other                   => other
 
 // One SSE frame as the events it carries.
 //
@@ -302,7 +421,42 @@ pub fn decode_error(status: Int, body: Str) -> LlmcFault []
 //         Err(_) => false
 // ```
 pub fn events_of_frame(f: LlmcSseFrame) -> Result<[LlmcEvent], LlmcFault> []
-    todo("llm-client-nv.llmcopenai.events_of_frame")
+    if llmcsse.is_done(f)
+        return Ok([])
+    let v = match json.parse(f.data)
+        Some(parsed) => parsed
+        None         =>
+            return Err(LlmcMalformedReply("stream chunk as JSON"))
+    var events: [LlmcEvent] = []
+    let choices = json.get_list(v, "choices") ?? []
+    if list.len(choices) > 0
+        let choice = choices[0]
+        let delta = json.get(choice, "delta") ?? json.null()
+        if json.get_str(delta, "role") != None
+            list.push(events, LlmcEventStart(json.get_str(v, "id") ?? "",
+                                             json.get_str(v, "model") ?? ""))
+        let content = json.get_str(delta, "content") ?? ""
+        if content != ""
+            list.push(events, LlmcEventText(content))
+        for tc in json.get_list(delta, "tool_calls") ?? []
+            let index = json.get_int(tc, "index") ?? 0
+            let fn_value = json.get(tc, "function") ?? json.null()
+            let id = json.get_str(tc, "id") ?? ""
+            if id != ""
+                list.push(events, LlmcEventToolStart(index, id,
+                                                     json.get_str(fn_value, "name") ?? ""))
+            let args = arguments_text(fn_value)
+            if args != ""
+                list.push(events, LlmcEventToolArgs(index, args))
+        match json.get_str(choice, "finish_reason")
+            Some(reason) => list.push(events, LlmcEventStop(llmcreply.stop_of_openai(reason)))
+            None         => 0
+    match json.get(v, "usage")
+        Some(u) =>
+            if not json.is_null(u)
+                list.push(events, LlmcEventUsage(decode_usage(u)))
+        None    => 0
+    Ok(events)
 
 // Whether a model name is one this dialect's `/v1/models` would list.
 //
@@ -321,4 +475,40 @@ pub fn events_of_frame(f: LlmcSseFrame) -> Result<[LlmcEvent], LlmcFault> []
 //     // : false
 // ```
 pub fn is_model_name(name: Str) -> Bool []
-    todo("llm-client-nv.llmcopenai.is_model_name")
+    name != "" and not llmcreq.is_qualified_model(name)
+
+// An assistant message with its tool calls: `content` is the text, or
+// null when there is none, and `tool_calls` is present only when the
+// turn made some.
+fn assistant_with_calls(text: Str, calls: [PromptMessage]) -> JsonValueH
+    var kv: [(Str, JsonValueH)] = [("role", json.string("assistant"))]
+    if text == ""
+        list.push(kv, ("content", json.null()))
+    else
+        list.push(kv, ("content", json.string(text)))
+    if list.len(calls) > 0
+        var out: [JsonValueH] = []
+        for c in calls
+            var args = c.text
+            if args == ""
+                args = "{}"
+            list.push(out, json.object([("id", json.string(c.call_id)),
+                                        ("type", json.string("function")),
+                                        ("function", json.object([("name", json.string(c.name)),
+                                                                  ("arguments", json.string(args))]))]))
+        list.push(kv, ("tool_calls", json.array(out)))
+    json.object(kv)
+
+// A call's arguments as text: the string a provider sends, or, for a
+// server that answers an object (Ollama does), that object serialised.
+fn arguments_text(fn_value: JsonValueH) -> Str
+    match json.get(fn_value, "arguments")
+        Some(a) =>
+            match json.to_str(a)
+                Some(s) => s
+                None    =>
+                    if json.is_null(a)
+                        ""
+                    else
+                        json.stringify(a)
+        None    => ""

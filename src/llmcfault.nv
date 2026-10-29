@@ -1,7 +1,5 @@
 // llmcfault.nv — why a request did not produce a reply.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.  A fault is a value built from a status code, a
 // response body and a header list the caller already holds.
 //
@@ -114,7 +112,13 @@ pub enum LlmcFault
 //     // : false
 // ```
 pub fn is_retryable(f: LlmcFault) -> Bool []
-    todo("llm-client-nv.llmcfault.is_retryable")
+    match f
+        LlmcRateLimited(_, _)  => true
+        LlmcServerError(_, _)  => true
+        LlmcOverloaded(_)      => true
+        LlmcTransportFailed(_) => true
+        LlmcTimedOut(_)        => true
+        _                      => false
 
 // Whether the fault is in the request the caller wrote.
 //
@@ -131,15 +135,19 @@ pub fn is_retryable(f: LlmcFault) -> Bool []
 //     // : true
 // ```
 pub fn is_caller_error(f: LlmcFault) -> Bool []
-    todo("llm-client-nv.llmcfault.is_caller_error")
+    match f
+        LlmcBadRequest(_, _, _)  => true
+        LlmcAuthFailed(_, _)     => true
+        LlmcUnsupported(_, _)    => true
+        LlmcBadEncoding(_)       => true
+        LlmcBudgetExceeded(_, _) => true
+        _                        => false
 
 // The rule every `LlmcFault` is printed by: name the decision, then
 // quote the provider verbatim.
 //
 // `Result<T, E>` requires `E: Error` (SPEC § 3.4), so this impl is what
-// makes every fallible signature in the package spellable.  It carries
-// a body on an interface release because a panic reporting a fault
-// through a `todo()` would print the wrong sentence.
+// makes every fallible signature in the package spellable.
 //
 // ```novo ignore
 // use llmcfault
@@ -174,7 +182,13 @@ impl Error for LlmcFault
 //     // : 429
 // ```
 pub fn status_of(f: LlmcFault) -> Int []
-    todo("llm-client-nv.llmcfault.status_of")
+    match f
+        LlmcBadRequest(status, _, _) => status
+        LlmcAuthFailed(status, _)    => status
+        LlmcRateLimited(_, _)        => 429
+        LlmcServerError(status, _)   => status
+        LlmcOverloaded(_)            => 529
+        _                            => 0
 
 // The fault a status code alone implies, before a dialect has read
 // the body.
@@ -193,7 +207,16 @@ pub fn status_of(f: LlmcFault) -> Int []
 //     // : 503
 // ```
 pub fn of_status(status: Int, message: Str) -> LlmcFault []
-    todo("llm-client-nv.llmcfault.of_status")
+    if status == 401 or status == 403
+        LlmcAuthFailed(status, message)
+    elif status == 429
+        LlmcRateLimited(0 - 1, message)
+    elif status == 529
+        LlmcOverloaded(message)
+    elif status >= 500
+        LlmcServerError(status, message)
+    else
+        LlmcBadRequest(status, "", message)
 
 // The same fault with a delay the response asked for.
 //
@@ -211,4 +234,6 @@ pub fn of_status(status: Int, message: Str) -> LlmcFault []
 //     // : 429
 // ```
 pub fn with_retry_after(f: LlmcFault, retry_after_ms: Int) -> LlmcFault []
-    todo("llm-client-nv.llmcfault.with_retry_after")
+    match f
+        LlmcRateLimited(_, message) => LlmcRateLimited(retry_after_ms, message)
+        _                           => f

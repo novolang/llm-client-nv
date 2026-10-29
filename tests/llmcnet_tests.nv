@@ -1,0 +1,605 @@
+use std.test
+use std.env
+use std.fs
+use std.process
+use std.proc
+use std.bytes
+use std.list
+use std.str
+use std.json
+use llmcchat
+use llmchttp
+use llmcreq
+use llmcfault
+use llmcretry
+use llmcsse
+use llmcreply
+use promptmsg
+
+// A stand-in chat API, started for one test and killed after it.
+//
+// It is Python's own HTTP server on loopback, plain and TLS, so that
+// what this package puts on the wire is parsed by an implementation it
+// shares no code with.  The certificate is made here with `openssl`,
+// self-signed, and trusted for this process only through
+// `SSL_CERT_FILE`.  The suite needs `python3` and `openssl` on the PATH.
+struct Stand
+    pid: Int
+    dir: Str
+
+fn stand_up() -> Stand [io, fs]
+    let (made, _) = process.run("mktemp -d")
+    let dir = str.trim(made)
+    let key = "${dir}/key.pem"
+    let cert = "${dir}/cert.pem"
+    let (_, status) = process.run("openssl req -x509 -newkey rsa:2048 -nodes -keyout ${key} -out ${cert} -days 2 -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 >/dev/null 2>&1")
+    test.assert_eq(status, 0)
+    let server = "${env.cwd()}/tests/fixtures/llmc_server.py"
+    let ports = "${dir}/ports.txt"
+    let pid = proc.spawn(["python3", server, cert, key, ports]) ?? 0 - 1
+    test.assert(pid > 0)
+    var waited = 0
+    while not fs.exists(ports) and waited < 50
+        let _slept = process.run("sleep 0.1")
+        waited = waited + 1
+    let both = str.split(str.trim(fs.read(ports) ?? "0 0"), " ")
+    process.env_set("LLMC_HTTP_PORT", both[0])
+    process.env_set("LLMC_HTTPS_PORT", both[1])
+    process.env_set("SSL_CERT_FILE", cert)
+    Stand { pid: pid, dir: dir }
+
+fn stand_down(s: Stand) [io]
+    let _killed = proc.kill(s.pid, 9)
+    proc.close(s.pid)
+    let _gone = process.run("rm -rf ${s.dir}")
+
+fn port(name: Str) -> Int
+    match env.get(name)
+        Some(v) => str.to_int(v) ?? 0
+        None    => 0
+
+fn plain() -> LlmcProvider
+    llmcreq.compatible("http://127.0.0.1:${port("LLMC_HTTP_PORT")}", "")
+
+fn secure() -> LlmcProvider
+    llmcreq.compatible("https://localhost:${port("LLMC_HTTPS_PORT")}", "sk-local")
+
+fn text_of(b: [u8]) -> Str
+    bytes.byte_list_to_str(list.map(b, x => x as Int))
+
+fn payload(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+@test
+fn test_the_stand_in_is_up() [io, fs]
+    let stand = stand_up()
+    test.assert(port("LLMC_HTTP_PORT") > 0)
+    test.assert(port("LLMC_HTTPS_PORT") > 0)
+    stand_down(stand)
+
+fn steered(route: Str) -> LlmcProvider
+    llmcreq.with_header(secure(), "X-Route", route)
+
+fn steered_plain(route: Str) -> LlmcProvider
+    llmcreq.with_header(plain(), "X-Route", route)
+
+fn a_request() -> LlmcRequest
+    llmcreq.with_params(llmcreq.request("gpt-4o-mini",
+                                        promptmsg.convo([promptmsg.user("capital of Denmark?")])),
+                        llmcreq.with_max_tokens(llmcreq.params(), 64))
+
+fn a_fault_message(r: Result<LlmcReply, LlmcFault>) -> Str
+    match r
+        Ok(_)  => "no fault"
+        Err(f) => f.message()
+
+// The echo route answers what an independent HTTP implementation saw.
+fn echoed(reply: LlmcHttpReply, key: Str) -> Str
+    match json.parse(text_of(reply.body))
+        None    => "not json"
+        Some(v) =>
+            match json.get(v, "headers")
+                Some(h) => json.get_str(h, key) ?? "absent"
+                None    => "no headers"
+
+@test
+fn test_tls_frames_a_request_the_other_side_parses() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(secure(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_exchange("POST", "/echo",
+                                     ["Content-Type: application/json", "Authorization: Bearer sk-local"],
+                                     payload("{\"a\":1}"))
+                Err(f)    => test.fail(f.message())
+                Ok(reply) =>
+                    test.case("status and body")
+                    test.assert(reply.status == 200)
+                    test.assert(not reply.streamed)
+                    test.case("the headers arrived as the caller wrote them")
+                    test.assert(echoed(reply, "authorization") == "Bearer sk-local")
+                    test.assert(echoed(reply, "content-type") == "application/json")
+                    test.case("the framing headers are the codec's")
+                    test.assert(echoed(reply, "content-length") == "7")
+                    test.assert(echoed(reply, "connection") == "close")
+                    test.assert(echoed(reply, "host") == "localhost")
+                    test.case("and the body is the caller's bytes")
+                    match json.parse(text_of(reply.body))
+                        Some(v) => test.assert(json.get_str(v, "body") == Some("{\"a\":1}"))
+                        None    => test.fail("the echo was not JSON")
+                    test.case("a second exchange dials again, because the first said close")
+                    match wire.llmc_exchange("POST", "/ok", [], payload(""))
+                        Err(f)  => test.fail(f.message())
+                        Ok(two) => test.assert(two.status == 200)
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    stand_down(stand)
+
+@test
+fn test_tls_decodes_a_chunked_body() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(secure(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_exchange("POST", "/chunked", [], payload("{}"))
+                Err(f)    => test.fail(f.message())
+                Ok(reply) =>
+                    match json.parse(text_of(reply.body))
+                        Some(v) => test.assert(json.get_str(v, "id") == Some("chatcmpl-1"))
+                        None    => test.fail("the chunks did not reassemble to JSON")
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    stand_down(stand)
+
+@test
+fn test_tls_streams_in_small_reads() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(secure(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_open("POST", "/sse", [], payload("{}"))
+                Err(f)   => test.fail(f.message())
+                Ok(head) =>
+                    test.assert(head.streamed)
+                    test.assert(llmchttp.is_event_stream(head.headers))
+                    var got: [u8] = []
+                    var reads = 0
+                    loop
+                        match wire.llmc_read(16)
+                            Err(f)    =>
+                                test.fail(f.message())
+                                break
+                            Ok(chunk) =>
+                                if list.len(chunk) == 0
+                                    break
+                                test.assert(list.len(chunk) <= 16)
+                                reads = reads + 1
+                                for b in chunk
+                                    list.push(got, b)
+                    test.case("the whole body came out, in more reads than the sixteen-byte cap allows one of")
+                    test.assert(reads > 4)
+                    test.assert(str.contains(text_of(got), "data: [DONE]"))
+                    test.case("and a read after the end stays at the end")
+                    match wire.llmc_read(16)
+                        Ok(chunk) => test.assert(list.len(chunk) == 0)
+                        Err(f)    => test.fail(f.message())
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    stand_down(stand)
+
+@test
+fn test_a_whole_chat_exchange_over_tls() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(secure(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            match llmcchat.send(llmcchat.client(secure()), t, a_request())
+                Err(f) => test.fail(f.message())
+                Ok(r)  =>
+                    test.assert(r.text == "Copenhagen.")
+                    test.assert(llmcreply.is_complete(r.stop))
+                    test.assert(r.usage.input_tokens == 9)
+    stand_down(stand)
+
+@test
+fn test_an_error_status_arrives_as_a_fault_with_the_servers_delay() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(steered("/status/429"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            match llmcchat.send(llmcchat.client(steered("/status/429")), t, a_request())
+                Ok(_)  => test.fail("a 429 decoded as a reply")
+                Err(f) =>
+                    test.case("rate limited, with Retry-After read as milliseconds")
+                    test.assert_eq_str(f.message(), "429 rate limited, retry after 2000 ms: stand-in refused")
+                    test.assert(llmcfault.is_retryable(f))
+    match llmchttp.dial_tls(steered("/status/400"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            match llmcchat.send(llmcchat.client(steered("/status/400")), t, a_request())
+                Ok(_)  => test.fail("a 400 decoded as a reply")
+                Err(f) =>
+                    test.case("a 400 carries the provider's own code")
+                    test.assert_eq_str(f.message(), "400 context_length_exceeded: stand-in refused")
+    match llmchttp.dial_tls(steered("/text-error"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            test.case("a gateway's plain-text body is kept verbatim")
+            test.assert(a_fault_message(llmcchat.send(llmcchat.client(steered("/text-error")), t, a_request()))
+                        == "503 the server failed: upstream connect error")
+    stand_down(stand)
+
+@test
+fn test_a_stream_is_drained_over_tls_in_the_callers_loop() [io, net, fs]
+    let stand = stand_up()
+    let c = llmcchat.client(steered("/sse"))
+    match llmchttp.dial_tls(steered("/sse"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match llmcchat.stream_open(c, var wire, a_request())
+                Err(f) => test.fail(f.message())
+                Ok(s0) =>
+                    var s = s0
+                    var text = ""
+                    loop
+                        if llmcsse.finished(s.acc)
+                            break
+                        match llmcchat.stream_next(c, var wire, s)
+                            Err(f)   =>
+                                test.fail(f.message())
+                                break
+                            Ok(step) =>
+                                s = step.state
+                                for e in step.events
+                                    text = text + llmcsse.text_delta(e)
+                    test.assert(text == "Copenhagen")
+                    match llmcsse.finish(s.acc)
+                        Ok(r)  =>
+                            test.assert(r.text == "Copenhagen")
+                            test.assert(r.id == "chatcmpl-9")
+                            test.assert(s.read_bytes > 0)
+                        Err(f) => test.fail(f.message())
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    stand_down(stand)
+
+@test
+fn test_a_server_that_ignores_stream_is_named_rather_than_read_as_a_truncation() [io, net, fs]
+    let stand = stand_up()
+    let c = llmcchat.client(steered("/sse-json"))
+    match llmchttp.dial_tls(steered("/sse-json"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match llmcchat.stream_open(c, var wire, a_request())
+                Ok(_)  => test.fail("a JSON answer opened as a stream")
+                Err(f) => test.assert_eq_str(f.message(),
+                    "this server, which answered content type application/json has no spelling for a streamed reply")
+    stand_down(stand)
+
+@test
+fn test_a_stream_error_status_is_decoded_not_streamed() [io, net, fs]
+    let stand = stand_up()
+    let c = llmcchat.client(steered("/status/429"))
+    match llmchttp.dial_tls(steered("/status/429"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match llmcchat.stream_open(c, var wire, a_request())
+                Ok(_)  => test.fail("a 429 opened as a stream")
+                Err(f) => test.assert(llmcfault.is_retryable(f))
+    stand_down(stand)
+
+@test
+fn test_a_stream_that_closes_with_no_terminal_event_is_truncated() [io, net, fs]
+    let stand = stand_up()
+    let c = llmcchat.client(steered("/empty-sse"))
+    match llmchttp.dial_tls(steered("/empty-sse"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match llmcchat.stream_open(c, var wire, a_request())
+                Err(f) => test.fail(f.message())
+                Ok(s)  =>
+                    match llmcchat.stream_next(c, var wire, s)
+                        Ok(_)  => test.fail("a closed stream read as more")
+                        Err(f) => test.assert_eq_str(f.message(), "the stream ended after 0 characters with no terminal event")
+    stand_down(stand)
+
+@test
+fn test_a_stalled_server_is_a_timeout_and_a_cut_connection_is_a_transport_fault() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(steered("/stall"), 300)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_exchange("POST", "/stall", [], payload(""))
+                Ok(_)  => test.fail("a stalled body completed")
+                Err(f) => test.assert_eq_str(f.message(), "no reply within 300 ms")
+    match llmchttp.dial_tls(secure(), 3000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_exchange("POST", "/truncated", [], payload(""))
+                Ok(_)  => test.fail("a cut body completed")
+                Err(f) => test.assert_eq_str(f.message(),
+                    "the request never completed: the connection closed before the response ended")
+    stand_down(stand)
+
+@test
+fn test_dialing_refuses_what_it_cannot_reach() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(plain(), 1000)
+        Ok(_)  => test.fail("TLS dialled a plain origin")
+        Err(f) => test.assert(f.message() == "the https scheme has no spelling for the TLS transport" or str.contains(f.message(), "http scheme"))
+    match llmchttp.dial_tls(llmcreq.compatible("https://localhost:1", ""), 1000)
+        Ok(_)  => test.fail("dialled a closed port")
+        Err(f) => test.assert(str.contains(f.message(), "TLS to localhost:1"))
+    stand_down(stand)
+
+@test
+fn test_a_retrying_send_waits_out_a_503_and_succeeds() [io, net, time, fs]
+    let stand = stand_up()
+    let policy = llmcretry.with_base_delay_ms(llmcretry.retry(), 20)
+    let c = llmcchat.with_retry(llmcchat.client(steered("/flaky")), policy)
+    match llmchttp.dial_tls(steered("/flaky"), 3000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            match llmcchat.send_retrying(c, t, a_request(), [0.5, 0.5, 0.5])
+                Err(f) => test.fail(f.message())
+                Ok(r)  => test.assert(r.text == "Copenhagen.")
+    stand_down(stand)
+
+@test
+fn test_the_standard_library_transport_speaks_the_same_dialogue() [io, net, time, async, fs]
+    let stand = stand_up()
+    match llmchttp.std_http(plain(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_exchange("POST", "/echo", ["Authorization: Bearer k", "X-A: b"],
+                                     payload("{\"a\":1}"))
+                Err(f)    => test.fail(f.message())
+                Ok(reply) =>
+                    test.assert(reply.status == 200)
+                    test.assert(echoed(reply, "authorization") == "Bearer k")
+                    test.assert(echoed(reply, "x-a") == "b")
+            test.case("it follows a redirect, as it promises")
+            match wire.llmc_exchange("POST", "/redirect", [], payload("{}"))
+                Err(f)    => test.fail(f.message())
+                Ok(reply) => test.assert(reply.status == 200)
+            test.case("and it times out where the deadline says")
+            match llmchttp.std_http(plain(), 300)
+                Err(f)   => test.fail(f.message())
+                Ok(slow) =>
+                    var w2 = slow
+                    match w2.llmc_exchange("POST", "/stall", [], payload(""))
+                        Ok(_)  => test.fail("a stalled body completed")
+                        Err(f) => test.assert(f.message() == "no reply within 300 ms" or str.contains(f.message(), "never completed"))
+    stand_down(stand)
+
+@test
+fn test_the_standard_library_transport_streams_and_decodes_a_chat() [io, net, time, async, fs]
+    let stand = stand_up()
+    match llmchttp.std_http(steered_plain("/sse"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            let c = llmcchat.client(steered_plain("/sse"))
+            match llmcchat.stream_open(c, var wire, a_request())
+                Err(f) => test.fail(f.message())
+                Ok(s0) =>
+                    var s = s0
+                    loop
+                        if llmcsse.finished(s.acc)
+                            break
+                        match llmcchat.stream_next(c, var wire, s)
+                            Err(f)   =>
+                                test.fail(f.message())
+                                break
+                            Ok(step) =>
+                                s = step.state
+                    test.assert(llmcsse.partial(s.acc).text == "Copenhagen")
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    match llmchttp.std_http(plain(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            match llmcchat.send(llmcchat.client(plain()), t, a_request())
+                Err(f) => test.fail(f.message())
+                Ok(r)  => test.assert(r.text == "Copenhagen.")
+    match llmchttp.std_http(plain(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            test.case("a read with nothing open, and a close with nothing open")
+            match wire.llmc_read(10)
+                Ok(_)  => test.fail("read from nothing")
+                Err(f) => test.assert(str.contains(f.message(), "before llmc_open"))
+            test.assert(wire.llmc_close() == None)
+    match llmchttp.std_http(llmcreq.compatible("http://127.0.0.1:1", ""), 500)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            test.case("a refused connection is a transport fault on both calls")
+            match wire.llmc_exchange("POST", "/echo", [], payload(""))
+                Ok(_)  => test.fail("connected to a closed port")
+                Err(f) => test.assert(llmcfault.is_retryable(f))
+            match wire.llmc_open("POST", "/echo", [], payload(""))
+                Ok(_)  => test.fail("connected to a closed port")
+                Err(f) => test.assert(llmcfault.is_retryable(f))
+    stand_down(stand)
+
+fn drained<T: LlmcTransport[e]>(var t: T, max: Int) -> Str [e]
+    var got: [u8] = []
+    loop
+        match t.llmc_read(max)
+            Err(f)    =>
+                return "fault: ${f.message()}"
+            Ok(chunk) =>
+                if list.len(chunk) == 0
+                    break
+                for b in chunk
+                    list.push(got, b)
+    text_of(got)
+
+@test
+fn test_interim_heads_trailers_and_headers_without_colons_over_tls() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(secure(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            test.case("a 100 Continue head is skipped, in an exchange and in an open")
+            match wire.llmc_exchange("POST", "/interim", ["NoColonHere"], payload("{}"))
+                Err(f)    => test.fail(f.message())
+                Ok(reply) => test.assert(reply.status == 200)
+            match wire.llmc_open("POST", "/interim", [], payload("{}"))
+                Err(f)   => test.fail(f.message())
+                Ok(head) => test.assert(head.status == 200)
+            test.assert(str.contains(drained(var wire, 4096), "Copenhagen."))
+            test.case("trailers after a chunked body are read past, in an exchange")
+            match wire.llmc_exchange("POST", "/sse", [], payload("{}"))
+                Err(f)    => test.fail(f.message())
+                Ok(reply) => test.assert(str.contains(text_of(reply.body), "[DONE]"))
+            test.case("a header whose name is not a token is refused before anything is sent")
+            match wire.llmc_exchange("POST", "/ok", ["bad name: x"], payload("{}"))
+                Ok(_)  => test.fail("a bad header went out")
+                Err(f) => test.assert(llmcfault.is_caller_error(f))
+            test.case("a server that reads the request and closes is a transport fault, not a hang")
+            match wire.llmc_exchange("POST", "/silent", [], payload("{}"))
+                Ok(_)  => test.fail("a silent server answered")
+                Err(f) => test.assert_eq_str(f.message(),
+                    "the request never completed: the connection closed before the response ended")
+            test.case("bytes that are not HTTP are a malformed reply")
+            match wire.llmc_exchange("POST", "/garbage", [], payload("{}"))
+                Ok(_)  => test.fail("garbage decoded")
+                Err(f) => test.assert(str.contains(f.message(), "an HTTP response"))
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    stand_down(stand)
+
+@test
+fn test_a_server_that_hangs_up_on_a_large_body_is_a_transport_fault() [io, net, fs]
+    let stand = stand_up()
+    match llmchttp.dial_tls(steered("/hangup"), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            let big = payload(str.repeat("x", 8000000))
+            match wire.llmc_exchange("POST", "/ok", ["X-Route: /hangup"], big)
+                Ok(_)  => test.fail("an exchange completed against a hangup")
+                Err(f) => test.assert(llmcfault.is_retryable(f))
+    stand_down(stand)
+
+@test
+fn test_the_standard_transport_streams_every_framing() [io, net, time, async, fs]
+    let stand = stand_up()
+    test.case("chunked, in sixteen-byte reads: the framing is gone and the rest is held")
+    match llmchttp.std_http(plain(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_open("POST", "/sse", [], payload("{}"))
+                Err(f)   => test.fail(f.message())
+                Ok(head) =>
+                    test.assert(head.streamed)
+                    let body = drained(var wire, 16)
+                    test.assert(str.starts_with(body, "data: {\"id\": \"chatcmpl-9\""))
+                    test.assert(str.ends_with(body, "data: [DONE]\n\n"))
+                    test.assert(not str.contains(body, "\r\n"))
+                    test.case("and a read after the end stays at the end")
+                    match wire.llmc_read(16)
+                        Ok(more) => test.assert(list.len(more) == 0)
+                        Err(f)   => test.fail(f.message())
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    test.case("closed by the socket, with no length")
+    match llmchttp.std_http(plain(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_open("POST", "/sse-close", [], payload("{}"))
+                Err(f)   => test.fail(f.message())
+                Ok(head) =>
+                    test.assert(head.status == 200)
+                    test.assert(str.contains(drained(var wire, 4096), "[DONE]"))
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    test.case("a chunk that arrives a piece at a time")
+    match llmchttp.std_http(plain(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_open("POST", "/sse-dribble", [], payload("{}"))
+                Err(f)   => test.fail(f.message())
+                Ok(head) =>
+                    test.assert(head.status == 200)
+                    test.assert_eq_str(drained(var wire, 4096),
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n")
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    test.case("a body that stops arriving is a fault on the read")
+    match llmchttp.std_http(plain(), 300)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_open("POST", "/stall", [], payload("{}"))
+                Err(f)   => test.fail(f.message())
+                Ok(head) =>
+                    test.assert(head.status == 200)
+                    test.assert(str.starts_with(drained(var wire, 4096), "fault: "))
+            let closed = wire.llmc_close()
+            test.assert(closed == None)
+    test.case("a head that is not HTTP fails the open")
+    match llmchttp.std_http(plain(), 2000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_open("POST", "/garbage", [], payload("{}"))
+                Ok(_)  => test.fail("garbage opened")
+                Err(f) => test.assert_eq_str(f.message(), "the request never completed: not an HTTP reply: this is not http")
+    test.case("a header line with no colon is passed over")
+    match llmchttp.std_http(plain(), 5000)
+        Err(f) => test.fail(f.message())
+        Ok(t)  =>
+            var wire = t
+            match wire.llmc_exchange("POST", "/ok", ["NoColonHere"], payload("{}"))
+                Err(f)    => test.fail(f.message())
+                Ok(reply) => test.assert(reply.status == 200)
+    stand_down(stand)
+
+@test
+fn test_header_lookup_and_event_stream_detection() [io]
+    let hs = ["Content-Type: Text/Event-Stream; charset=utf-8", "retry-after:  6 ", "no colon here"]
+    test.assert_eq_str(llmchttp.header_of(hs, "Retry-After") ?? "absent", "6")
+    test.assert_eq_str(llmchttp.header_of(hs, "CONTENT-TYPE") ?? "absent", "Text/Event-Stream; charset=utf-8")
+    test.assert(llmchttp.header_of(hs, "x-missing") == None)
+    test.assert(llmchttp.is_event_stream(hs))
+    test.assert(not llmchttp.is_event_stream(["Content-Type: application/json"]))
+    test.assert(not llmchttp.is_event_stream([]))
+
+fn origin(url: Str) -> Str
+    match llmchttp.origin_of(llmcreq.compatible(url, ""))
+        Ok(o)  => "${o.scheme} ${o.host} ${o.port}"
+        Err(f) => f.message()
+
+@test
+fn test_origins_split_into_scheme_host_and_port() [io]
+    test.assert_eq_str(origin("https://api.openai.com"), "https api.openai.com 443")
+    test.assert_eq_str(origin("http://127.0.0.1:8080"), "http 127.0.0.1 8080")
+    test.assert_eq_str(origin("HTTP://Example.org/v1/"), "http Example.org 80")
+    test.assert_eq_str(origin("https://[::1]:9443/x"), "https [::1] 9443")
+    test.assert_eq_str(origin("https://[::1]"), "https [::1] 443")
+    test.assert_eq_str(origin("api.openai.com"),
+        "the request cannot be encoded: the origin api.openai.com has no scheme://")
+    test.assert(str.contains(origin("ftp://x"), "ftp scheme"))
+    test.assert(str.contains(origin("https://[::1"), "unclosed ["))
+    test.assert(str.contains(origin("https://h:abc"), "port that is not a number"))
+    test.assert(str.contains(origin("https://[::1]x"), "text after its host"))
+    test.assert(str.contains(origin("https://:80"), "no usable host and port"))
+    test.assert(str.contains(origin("https://h:0"), "no usable host and port"))

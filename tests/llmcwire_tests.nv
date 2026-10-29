@@ -1,9 +1,6 @@
 // llmcwire_tests.nv — the two dialects' differences, each of which is
 // a 400 or a wrong answer for a client that assumed the other.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// llm-client-nv.<module>.<fn>`.
 
 use std.test
 use std.json

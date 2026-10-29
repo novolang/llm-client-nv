@@ -1,9 +1,5 @@
 // llmcretry_tests.nv — the backoff, asserted exactly, with no clock.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// llm-client-nv.<module>.<fn>`.
-//
 // THE WHOLE FILE IS THE JITTER PARAMETER PAYING FOR ITSELF.  The
 // uniforms are arguments, so a schedule is a pure function of the
 // policy and the sequence, and these assertions are numbers rather

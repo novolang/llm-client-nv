@@ -1,0 +1,708 @@
+// llmcedge_tests.nv — the boundaries the API suites leave open: every
+// fault variant, the SSE grammar's corners, the request checks, the
+// retry arithmetic, the date and duration spellings, the token
+// estimate and the session-level calls.
+//
+// WHERE THE EXPECTED VALUES COME FROM.  The SSE cases are the grammar of
+// the HTML Standard's "Server-sent events" section (field parsing,
+// blank-line dispatch, CR, LF and CRLF line ends, comments).  The HTTP
+// date is RFC 9110's own example, Sun, 06 Nov 1994 08:49:37 GMT, which
+// is 784111777 seconds after the epoch (`date -d` agrees).  The
+// duration spellings are Go's `time.ParseDuration` ones, which is what
+// OpenAI's rate-limit headers use.
+
+use std.test
+use std.bytes
+use std.json
+use std.list
+use std.str
+use llmcchat
+use llmcfault
+use llmchttp
+use llmcreply
+use llmcreq
+use llmcretry
+use llmcsse
+use promptmsg
+use tokmodel
+
+// ── faults ──────────────────────────────────────────────────────────
+
+fn every_fault() -> [LlmcFault]
+    [LlmcBadRequest(400, "c", "m"), LlmcAuthFailed(401, "m"), LlmcRateLimited(1500, "m"),
+     LlmcServerError(502, "m"), LlmcOverloaded("m"), LlmcTransportFailed("m"),
+     LlmcTimedOut(30), LlmcMalformedReply("w"), LlmcStreamTruncated(7),
+     LlmcUnsupported("f", "d"), LlmcBadEncoding("w"), LlmcBudgetExceeded(9, 4)]
+
+@test
+fn test_every_fault_says_whether_to_retry_whose_fault_it_is_and_its_status() [io]
+    let retry = [false, false, true, true, true, true, true, false, false, false, false, false]
+    let caller = [true, true, false, false, false, false, false, false, false, true, true, true]
+    let status = [400, 401, 429, 502, 529, 0, 0, 0, 0, 0, 0, 0]
+    let said = ["400 c: m", "401 the key was refused: m", "429 rate limited, retry after 1500 ms: m",
+                "502 the server failed: m", "the provider is at capacity: m",
+                "the request never completed: m", "no reply within 30 ms",
+                "the reply had no w", "the stream ended after 7 characters with no terminal event",
+                "d has no spelling for f", "the request cannot be encoded: w",
+                "9 tokens against a budget of 4"]
+    let faults = every_fault()
+    for i in 0..list.len(faults)
+        test.assert(llmcfault.is_retryable(faults[i]) == retry[i])
+        test.assert(llmcfault.is_caller_error(faults[i]) == caller[i])
+        test.assert(llmcfault.status_of(faults[i]) == status[i])
+        test.assert_eq_str(faults[i].message(), said[i])
+
+@test
+fn test_a_status_alone_maps_to_the_documented_fault() [io]
+    test.assert_eq_str(llmcfault.of_status(401, "x").message(), "401 the key was refused: x")
+    test.assert_eq_str(llmcfault.of_status(403, "x").message(), "403 the key was refused: x")
+    test.assert_eq_str(llmcfault.of_status(429, "x").message(), "429 rate limited, retry after -1 ms: x")
+    test.assert_eq_str(llmcfault.of_status(529, "x").message(), "the provider is at capacity: x")
+    test.assert_eq_str(llmcfault.of_status(503, "x").message(), "503 the server failed: x")
+    test.assert_eq_str(llmcfault.of_status(404, "x").message(), "404 : x")
+    test.case("only a rate limit takes a delay")
+    test.assert_eq_str(llmcfault.with_retry_after(LlmcRateLimited(0 - 1, "m"), 2000).message(),
+        "429 rate limited, retry after 2000 ms: m")
+    test.assert_eq_str(llmcfault.with_retry_after(LlmcOverloaded("m"), 2000).message(),
+        "the provider is at capacity: m")
+
+// ── replies ─────────────────────────────────────────────────────────
+
+fn call(id: Str, name: Str, args: Str) -> LlmcToolCall
+    LlmcToolCall { id: id, name: name, arguments: args }
+
+fn reply_of(stop: LlmcStop, text: Str, calls: [LlmcToolCall]) -> LlmcReply
+    LlmcReply { stop: stop,
+        text: text,
+        tool_calls: calls,
+        usage: llmcreply.no_usage(),
+        model: "m",
+        id: "i" }
+
+@test
+fn test_stops_notes_and_vocabularies() [io]
+    test.assert_eq_str(llmcreply.stop_note(LlmcStopEnd), "")
+    test.assert_eq_str(llmcreply.stop_note(LlmcStopSequence("x")), "")
+    test.assert_eq_str(llmcreply.stop_note(LlmcStopMaxTokens), "the answer was cut off at the length limit")
+    test.assert_eq_str(llmcreply.stop_note(LlmcStopToolUse), "the model asked for tools instead of answering")
+    test.assert_eq_str(llmcreply.stop_note(LlmcStopFiltered("content_filter")),
+        "the provider stopped the answer (content_filter)")
+    test.assert_eq_str(llmcreply.stop_note(LlmcStopOther("zzz")),
+        "the answer ended for a reason this client does not know (zzz)")
+    test.assert(llmcreply.is_complete(LlmcStopSequence("x")))
+    test.assert(not llmcreply.is_complete(LlmcStopToolUse))
+    test.assert(not llmcreply.is_complete(LlmcStopFiltered("f")))
+    test.assert(llmcreply.stop_of_openai("tool_calls") == LlmcStopToolUse)
+    test.assert(llmcreply.stop_of_openai("function_call") == LlmcStopToolUse)
+    test.assert(llmcreply.stop_of_openai("content_filter") == LlmcStopFiltered("content_filter"))
+    test.assert(llmcreply.stop_of_openai("stop") == LlmcStopEnd)
+    test.assert(llmcreply.stop_of_anthropic("tool_use") == LlmcStopToolUse)
+    test.assert(llmcreply.stop_of_anthropic("refusal") == LlmcStopFiltered("refusal"))
+    test.assert(llmcreply.stop_of_anthropic("stop_sequence") == LlmcStopSequence(""))
+    test.assert(llmcreply.stop_of_anthropic("pause_turn") == LlmcStopOther("pause_turn"))
+
+@test
+fn test_the_tool_obligation_is_owed_until_the_results_are_in() [io]
+    let r = reply_of(LlmcStopToolUse, "", [call("a", "now", "{}"), call("b", "now", "{\"tz\":1}")])
+    test.assert(llmcreply.owed_tool_results(r) == ["a", "b"])
+    test.case("a reply that did not stop for tools owes nothing, whatever it carries")
+    test.assert(list.len(llmcreply.owed_tool_results(reply_of(LlmcStopEnd, "x", [call("a", "now", "{}")]))) == 0)
+    let asked = promptmsg.convo([promptmsg.user("q")])
+    test.assert(llmcreply.unanswered(r, asked) == ["a", "b"])
+    test.case("one result discharges one id, and it must be the id and not the name")
+    let half = promptmsg.push(asked, promptmsg.tool_result("now", "a", "ok"))
+    test.assert(llmcreply.unanswered(r, half) == ["b"])
+    let wrong_id = promptmsg.push(asked, promptmsg.tool_result("now", "zzz", "ok"))
+    test.assert(llmcreply.unanswered(r, wrong_id) == ["a", "b"])
+    let both = promptmsg.push(half, promptmsg.tool_result("now", "b", "ok"))
+    test.assert(list.len(llmcreply.unanswered(r, both)) == 0)
+    test.case("lookup by id")
+    match llmcreply.call_by_id(r, "b")
+        Some(c) => test.assert(c.arguments == "{\"tz\":1}")
+        None    => test.fail("call b not found")
+    test.assert(llmcreply.call_by_id(r, "zzz") == None)
+
+@test
+fn test_a_turn_becomes_messages_that_keep_the_arguments() [io]
+    let r = reply_of(LlmcStopToolUse, "looking", [call("a", "now", "{\"x\":1}"), call("b", "later", "{}")])
+    let ms = llmcreply.to_messages(r)
+    test.assert(list.len(ms) == 3)
+    test.assert(ms[0].role == PromptAssistant and ms[0].text == "looking" and ms[0].name == "")
+    test.assert(ms[1].role == PromptAssistant and ms[1].name == "now" and ms[1].call_id == "a" and ms[1].text == "{\"x\":1}")
+    test.assert(ms[2].call_id == "b")
+    test.case("with no text the calls stand alone, and with neither there is one empty message")
+    test.assert(list.len(llmcreply.to_messages(reply_of(LlmcStopToolUse, "", [call("a", "now", "{}")]))) == 1)
+    test.assert(list.len(llmcreply.to_messages(llmcreply.empty_reply())) == 1)
+    test.assert(llmcreply.to_message(r).text == "looking")
+    test.case("a conversation built that way answers the request check")
+    let c = llmcchat.append_tool_result(llmcchat.append_tool_result(
+                llmcchat.append_reply(promptmsg.convo([promptmsg.user("q")]), r),
+                r.tool_calls[0], "r1"),
+                r.tool_calls[1], "r2")
+    test.assert(list.len(llmcreply.unanswered(r, c)) == 0)
+    match llmcreq.check(llmcreq.request("m", c), LlmcOpenAiChat)
+        Ok(n)  => test.assert(n == 6)
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_a_call_message_is_told_from_a_plain_assistant_message() [io]
+    test.assert(llmcreq.is_call(PromptMessage { role: PromptAssistant, text: "{}", name: "now", call_id: "c" }))
+    test.assert(not llmcreq.is_call(promptmsg.assistant("hi")))
+    test.assert(not llmcreq.is_call(promptmsg.tool_result("now", "c", "x")))
+    test.assert(not llmcreq.is_call(PromptMessage { role: PromptAssistant, text: "", name: "now", call_id: "" }))
+
+@test
+fn test_json_in_a_reply_and_in_arguments() [io]
+    match llmcreply.json_of(reply_of(LlmcStopEnd, "{\"a\":1}", []))
+        Ok(v)  => test.assert(json.get_int(v, "a") == Some(1))
+        Err(f) => test.fail(f.message())
+    match llmcreply.json_of(reply_of(LlmcStopMaxTokens, "{\"a\":", []))
+        Ok(_)  => test.fail("a prefix parsed")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no text as JSON")
+    match llmcreply.arguments_json(call("a", "now", "{\"a\":"))
+        Ok(_)  => test.fail("a prefix parsed")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no arguments of tool call a as JSON")
+    let u = LlmcUsage { input_tokens: 1, output_tokens: 2, cached_input_tokens: 3, reasoning_tokens: 4 }
+    let sum = llmcreply.add_usage(u, u)
+    test.assert(sum.input_tokens == 2 and sum.output_tokens == 4 and sum.cached_input_tokens == 6 and sum.reasoning_tokens == 8)
+    test.assert(llmcreply.total_tokens(u) == 3)
+
+// ── server-sent events ──────────────────────────────────────────────
+
+fn chunk(s: Str) -> [u8]
+    bytes.to_byte_list(bytes.from_str(s))
+
+// Every frame the reader yields for these chunks, fed in order and
+// drained after each.
+fn frames_of(parts: [Str]) -> [LlmcSseFrame]
+    var out: [LlmcSseFrame] = []
+    var r = llmcsse.reader()
+    for p in parts
+        match llmcsse.feed(r, chunk(p))
+            Err(_) =>
+                return out
+            Ok(s0) =>
+                var s = s0
+                loop
+                    match s.frame
+                        None    =>
+                            break
+                        Some(f) =>
+                            list.push(out, f)
+                            match llmcsse.take(s.reader)
+                                Ok(next) =>
+                                    s = next
+                                Err(_)   =>
+                                    return out
+                r = s.reader
+    out
+
+@test
+fn test_line_ends_comments_fields_and_blank_lines() [io]
+    test.case("LF, CRLF and CR all end a line")
+    for wire in ["data: a\n\n", "data: a\r\n\r\n", "data: a\r\r", "data: a\n\r\n", "data: a\r\n\n"]
+        let got = frames_of([wire + "x"])
+        test.assert(list.len(got) == 1)
+        test.assert(got[0].data == "a")
+    test.case("a CR at the end of what has arrived waits to see whether an LF follows")
+    test.assert(list.len(frames_of(["data: a\r\n\r"])) == 0)
+    test.assert(list.len(frames_of(["data: a\r\n\r", "\n"])) == 1)
+    test.case("fields: event, id and retry, a comment, a line with no colon, one space stripped")
+    let fields = frames_of([": a comment\nevent: ping\nid: 7\nretry: 1500\ndata:no space\ndata:  two spaces\nbogus\n\n"])
+    test.assert(list.len(fields) == 1)
+    test.assert_eq_str(fields[0].event, "ping")
+    test.assert_eq_str(fields[0].id, "7")
+    test.assert(fields[0].retry_ms == 1500)
+    test.assert_eq_str(fields[0].data, "no space\n two spaces")
+    test.case("a retry that is not a number leaves the default, a field name alone is an empty value")
+    let odd = frames_of(["retry: soon\ndata\n\n"])
+    test.assert(odd[0].retry_ms == 0 - 1)
+    test.assert_eq_str(odd[0].data, "")
+    test.case("blank lines between frames, and a frame with no data line, make no frame; fields do not leak across")
+    let two = frames_of(["\n\nevent: lonely\nid: 1\n\ndata: a\n\ndata: b\n\n"])
+    test.assert(list.len(two) == 2)
+    test.assert_eq_str(two[0].event, "")
+    test.assert_eq_str(two[0].id, "")
+    test.assert_eq_str(two[1].data, "b")
+    test.case("a frame split anywhere is one frame")
+    let split = frames_of(["da", "ta: he", "llo\n", "\n"])
+    test.assert(list.len(split) == 1)
+    test.assert_eq_str(split[0].data, "hello")
+    test.case("the DONE sentinel, with or without space")
+    test.assert(llmcsse.is_done(LlmcSseFrame { event: "", data: " [DONE] ", id: "", retry_ms: 0 - 1 }))
+    test.assert(not llmcsse.is_done(LlmcSseFrame { event: "", data: "{}", id: "", retry_ms: 0 - 1 }))
+
+@test
+fn test_a_peer_cannot_make_the_reader_hold_more_than_it_was_told_to() [io]
+    test.case("a complete frame over the limit is refused as well as an unfinished one")
+    match llmcsse.feed(llmcsse.reader_with(12), chunk("data: 0123456789\n\n"))
+        Ok(_)  => test.fail("a big frame was taken")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no an event frame under 12 bytes")
+    test.case("frames that fit are taken, and what is left over is counted")
+    match llmcsse.feed(llmcsse.reader_with(12), chunk("data: a\n\ndata: b\n\ndata: c"))
+        Err(f) => test.fail(f.message())
+        Ok(s)  =>
+            test.assert(llmcsse.pending_len(s.reader) == 16)
+            match llmcsse.take(s.reader)
+                Err(f)     => test.fail(f.message())
+                Ok(second) =>
+                    test.assert(second.frame != None)
+                    test.assert(llmcsse.pending_len(second.reader) == 7)
+    test.assert(llmcsse.reader().max_frame == 1048576)
+
+@test
+fn test_the_accumulator_keeps_the_first_stop_and_merges_usage() [io]
+    var s = llmcsse.stream()
+    test.assert(not llmcsse.finished(s))
+    s = llmcsse.apply(s, LlmcEventStop(LlmcStopMaxTokens))
+    s = llmcsse.apply(s, LlmcEventStop(LlmcStopEnd))
+    test.assert(llmcsse.finished(s))
+    test.assert(llmcsse.partial(s).stop == LlmcStopMaxTokens)
+    s = llmcsse.apply(s,
+        LlmcEventUsage(LlmcUsage { input_tokens: 5, output_tokens: 0, cached_input_tokens: 2, reasoning_tokens: 0 }))
+    s = llmcsse.apply(s,
+        LlmcEventUsage(LlmcUsage { input_tokens: 0, output_tokens: 9, cached_input_tokens: 0, reasoning_tokens: 1 }))
+    let u = llmcsse.partial(s).usage
+    test.assert(u.input_tokens == 5 and u.output_tokens == 9 and u.cached_input_tokens == 2 and u.reasoning_tokens == 1)
+    test.case("an unfinished stream shows as a reply that is not complete, and finish refuses it")
+    var open = llmcsse.apply(llmcsse.stream(), LlmcEventText("half"))
+    open = llmcsse.apply(open, LlmcEventStart("i", "m"))
+    test.assert(not llmcreply.is_complete(llmcsse.partial(open).stop))
+    match llmcsse.finish(open)
+        Ok(_)  => test.fail("an unfinished stream finished")
+        Err(f) => test.assert_eq_str(f.message(), "the stream ended after 4 characters with no terminal event")
+    test.assert(llmcsse.text_delta(LlmcEventPing) == "")
+    test.case("tool arguments for an index that never started still accumulate")
+    let loose = llmcsse.apply(llmcsse.stream(), LlmcEventToolArgs(1, "{}"))
+    test.assert(list.len(llmcsse.partial(loose).tool_calls) == 1)
+
+// ── the request checks ──────────────────────────────────────────────
+
+fn ask(model: Str, ms: [PromptMessage]) -> LlmcRequest
+    llmcreq.with_params(llmcreq.request(model, promptmsg.convo(ms)),
+                        llmcreq.with_max_tokens(llmcreq.params(), 100))
+
+fn refused(r: LlmcRequest, d: LlmcDialect) -> Str
+    match llmcreq.check(r, d)
+        Ok(_)  => "accepted"
+        Err(f) => f.message()
+
+fn a_call(id: Str) -> PromptMessage
+    PromptMessage { role: PromptAssistant, text: "{}", name: "now", call_id: id }
+
+@test
+fn test_each_refusal_names_what_was_wrong() [io]
+    let u = promptmsg.user("q")
+    test.assert_eq_str(refused(ask("", [u]), LlmcOpenAiChat),
+        "the request cannot be encoded: the request names no model")
+    test.assert(str.contains(refused(ask("m", []), LlmcOpenAiChat), "no message"))
+    let zero = llmcreq.with_params(llmcreq.request("m", promptmsg.convo([u])), llmcreq.with_max_tokens(llmcreq.params(), 0))
+    test.assert(str.contains(refused(zero, LlmcOpenAiChat), "max_tokens is zero"))
+    test.case("anthropic: no cap, a seed, a bare JSON format, a schema beside tools")
+    let uncapped = llmcreq.request("m", promptmsg.convo([u]))
+    test.assert(str.contains(refused(uncapped, LlmcAnthropicMessages), "max_tokens is required"))
+    let tool = llmcreq.tool("now", "d", json.object([]))
+    let shaped = llmcreq.with_tools(llmcreq.with_format(ask("m", [u]), LlmcFormatSchema("a", json.object([]), false)), [tool])
+    test.assert_eq_str(refused(shaped, LlmcAnthropicMessages),
+        "anthropic has no spelling for a response schema beside tools")
+    test.assert_eq_str(refused(llmcreq.with_format(ask("m", [u]), LlmcFormatJson), LlmcAnthropicMessages),
+        "anthropic has no spelling for a JSON response format with no schema")
+    test.case("tool names, choices and schema names")
+    test.assert(str.contains(refused(llmcreq.with_tools(ask("m", [u]), [llmcreq.tool("bad name", "d", json.object([]))]),
+        LlmcOpenAiChat),
+    "\"bad name\""))
+    test.assert_eq_str(refused(llmcreq.with_tool_choice(llmcreq.with_tools(ask("m", [u]), [tool]), LlmcToolNamed("other")),
+        LlmcOpenAiChat),
+    "the request cannot be encoded: the tool other is forced and is not offered")
+    test.assert(str.contains(refused(llmcreq.with_format(ask("m", [u]), LlmcFormatSchema("no spaces", json.object([]), false)),
+        LlmcOpenAiChat),
+    "the schema name"))
+    test.assert_eq_str(refused(llmcreq.with_tool_choice(llmcreq.with_tools(ask("m", [u]), [tool]), LlmcToolNamed("now")),
+        LlmcOpenAiChat),
+    "accepted")
+    test.assert_eq_str(refused(llmcreq.with_format(ask("m", [u]), LlmcFormatSchema("ok_name", json.object([]), false)),
+        LlmcOpenAiChat),
+    "accepted")
+    test.case("a tool result with no id, with an id nobody made, and a call nobody answered")
+    test.assert(str.contains(refused(ask("m",
+        [u, a_call("c"), promptmsg.tool_result("now", "c", "x"), promptmsg.tool_result("now", "", "y")]),
+    LlmcOpenAiChat),
+    "position 3 names no call id"))
+    test.assert(str.contains(refused(ask("m", [u,
+        a_call("c"),
+        promptmsg.tool_result("now", "c", "x"),
+        promptmsg.tool_result("now", "zzz", "x")]),
+    LlmcOpenAiChat),
+    "call id zzz, which no assistant turn made"))
+    test.assert_eq_str(refused(ask("m", [u, a_call("c"), promptmsg.user("next")]), LlmcOpenAiChat),
+        "the request cannot be encoded: the tool call c at position 1 has no result after it")
+    test.case("a result before its call is as bad as no call")
+    test.assert(str.contains(refused(ask("m", [u, promptmsg.assistant("x"), promptmsg.tool_result("now", "c", "x"), a_call("c")]),
+        LlmcOpenAiChat),
+    "which no assistant turn made") or str.contains(refused(ask("m", [u, promptmsg.assistant("x"), promptmsg.tool_result("now", "c", "x"), a_call("c")]),
+        LlmcOpenAiChat),
+    "has no result after it"))
+    test.case("names")
+    test.assert(llmcreq.is_tool_name("a-b_9"))
+    test.assert(not llmcreq.is_tool_name(""))
+    test.assert(not llmcreq.is_tool_name(str.repeat("a", 65)))
+    test.assert(llmcreq.is_tool_name(str.repeat("a", 64)))
+    test.assert(not llmcreq.is_tool_name("a.b"))
+    test.assert(llmcreq.is_qualified_model("Anthropic:claude"))
+    test.assert(not llmcreq.is_qualified_model("llama3:8b"))
+    test.assert(not llmcreq.is_qualified_model("plain"))
+
+@test
+fn test_a_provider_is_a_value_and_its_key_stays_out_of_logs() [io]
+    test.assert(llmcreq.dialect_of_name("openai") != None)
+    let org = LlmcProvider { dialect: LlmcOpenAiChat, base_url: "https://x", api_key: "sk-0123456789",
+                             api_version: "", organization: "org-1", extra_headers: ["X-A: b"] }
+    test.assert(llmcreq.auth_headers(org) == ["Authorization: Bearer sk-0123456789",
+        "Content-Type: application/json",
+        "OpenAI-Organization: org-1",
+        "X-A: b"])
+    test.assert(llmcreq.auth_headers(llmcreq.anthropic("k")) == ["x-api-key: k", "anthropic-version: 2023-06-01", "Content-Type: application/json"])
+    test.assert(llmcreq.auth_headers(llmcreq.compatible("http://h", "")) == ["Content-Type: application/json"])
+    test.assert_eq_str(llmcreq.redacted(org), "openai https://x key=…6789")
+    test.assert_eq_str(llmcreq.redacted(llmcreq.openai("short")), "openai https://api.openai.com key=****")
+    test.assert_eq_str(llmcreq.redacted(llmcreq.openai("")), "openai https://api.openai.com key=none")
+    test.assert(llmcreq.with_api_version(llmcreq.anthropic("k"), "2024-01-01").api_version == "2024-01-01")
+
+fn tiny_model() -> Result<TokModel, TokFault>
+    tokmodel.of_tokenizer_json("{\"model\": {\"type\": \"BPE\", \"vocab\": {\"a\": 0, \"b\": 1, \"ab\": 2}, \"merges\": [[\"a\", \"b\"]]}, \"pre_tokenizer\": {\"type\": \"ByteLevel\"}}")
+
+@test
+fn test_the_token_estimate_is_the_sum_of_what_the_wire_carries() [io]
+    match tiny_model()
+        Err(e) => test.fail(e.message())
+        Ok(m)  =>
+            test.assert(tokmodel.token_count(m, "abab") == 2)
+            let tool = llmcreq.tool("ab", "abab", json.object([]))
+            let plain = ask("m", [promptmsg.user("abab")])
+            let with_tool = llmcreq.with_tools(plain, [tool])
+            let tool_cost = llmcreq.tools_tokens(m, [tool])
+            test.assert(tool_cost == 7 + 1 + 2 + tokmodel.token_count(m, "{}"))
+            test.assert(llmcreq.request_tokens(m, plain) == 3 + 4 + 2 + 0)
+            test.assert(llmcreq.request_tokens(m, with_tool) == llmcreq.request_tokens(m, plain) + tool_cost)
+            test.case("a format adds its schema")
+            let json_mode = llmcreq.with_format(plain, LlmcFormatJson)
+            test.assert(llmcreq.request_tokens(m, json_mode) == llmcreq.request_tokens(m, plain) + 4)
+            let schema = llmcreq.with_format(plain, LlmcFormatSchema("ab", json.object([]), true))
+            test.assert(llmcreq.request_tokens(m, schema) == llmcreq.request_tokens(m, plain) + 8 + 1 + tokmodel.token_count(m, "{}"))
+            test.case("the budget is a local refusal")
+            match llmcreq.check_budget(m, plain, 100)
+                Ok(n)  => test.assert(n == 9)
+                Err(f) => test.fail(f.message())
+            match llmcreq.check_budget(m, plain, 8)
+                Ok(_)  => test.fail("a request over the budget was accepted")
+                Err(f) => test.assert_eq_str(f.message(), "9 tokens against a budget of 8")
+
+// ── retry ───────────────────────────────────────────────────────────
+
+@test
+fn test_every_duration_spelling() [io]
+    test.assert(llmcretry.parse_duration_ms("6") == 6000)
+    test.assert(llmcretry.parse_duration_ms(" 0 ") == 0)
+    test.assert(llmcretry.parse_duration_ms("1.5") == 1500)
+    test.assert(llmcretry.parse_duration_ms("6m0s") == 360000)
+    test.assert(llmcretry.parse_duration_ms("1h2m3s") == 3723000)
+    test.assert(llmcretry.parse_duration_ms("1.5s") == 1500)
+    test.assert(llmcretry.parse_duration_ms("840ms") == 840)
+    test.assert(llmcretry.parse_duration_ms("250us") == 0)
+    test.assert(llmcretry.parse_duration_ms("500µs") == 1)
+    test.assert(llmcretry.parse_duration_ms("2000000ns") == 2)
+    test.case("what cannot be read is -1, never 0")
+    for bad in ["", "   ", "soon", "s", "6x", "6m0", "6 s", "-3", "Sun, 06 Nov 1994 08:49:37 GMT", "1..5"]
+        test.assert(llmcretry.parse_duration_ms(bad) == 0 - 1)
+
+@test
+fn test_retry_after_resolves_a_date_against_the_clock_reading() [io]
+    let epoch_ms = 784111777000
+    test.assert(llmcretry.retry_after_from("Sun, 06 Nov 1994 08:49:37 GMT", epoch_ms - 4000) == 4000)
+    test.assert(llmcretry.retry_after_from("Sun, 06 Nov 1994 08:49:37 GMT", epoch_ms + 9000) == 0)
+    test.assert(llmcretry.retry_after_from("120", 5) == 120000)
+    test.assert(llmcretry.retry_after_from("Sun, 06 Nov 1994 08:49:37 GMT", 0) == epoch_ms)
+    test.case("a date that is not an IMF-fixdate is unreadable")
+    for bad in ["Sunday, 06-Nov-94 08:49:37 GMT", "Sun, 06 Nov 1994 08:49 GMT", "Sun, 06 Nov 1994 08:49:37 UTC",
+                "Sun, 06 Foo 1994 08:49:37 GMT", "Sun, 32 Nov 1994 08:49:37 GMT", "Sun, 06 Nov 1969 08:49:37 GMT",
+                "Sun, 06 Nov 1994 25:49:37 GMT", "Sun, 06 Nov 1994 08:61:37 GMT", "Sun, 06 Nov 1994 08:49:x GMT",
+                "Sun 06 Nov 1994 08:49:37 GMT", "nonsense"]
+        test.assert(llmcretry.retry_after_from(bad, 0) == 0 - 1)
+    test.case("a leap day and a later year")
+    test.assert(llmcretry.retry_after_from("Thu, 29 Feb 2024 00:00:00 GMT", 0) == 1709164800000)
+    test.assert(llmcretry.retry_after_from("Sat, 01 Jan 2000 00:00:00 GMT", 0) == 946684800000)
+
+@test
+fn test_both_providers_headers_and_the_bucket_that_is_empty() [io]
+    let o = llmcretry.limits_of(["x-ratelimit-remaining-requests: 0", "x-ratelimit-remaining-tokens: 4000",
+                                 "x-ratelimit-reset-requests: 6m0s", "x-ratelimit-reset-tokens: 840ms",
+                                 "Retry-After: 7"])
+    test.assert(o.requests_remaining == 0 and o.tokens_remaining == 4000)
+    test.assert(o.requests_reset_ms == 360000 and o.tokens_reset_ms == 840 and o.retry_after_ms == 7000)
+    let a = llmcretry.limits_of(["anthropic-ratelimit-requests-remaining: 9", "anthropic-ratelimit-tokens-remaining: 0",
+                                 "anthropic-ratelimit-requests-reset: 2s", "anthropic-ratelimit-tokens-reset: 3s"])
+    test.assert(a.requests_remaining == 9 and a.tokens_remaining == 0)
+    test.assert(a.requests_reset_ms == 2000 and a.tokens_reset_ms == 3000 and a.retry_after_ms == 0 - 1)
+    test.case("a count that is not a number is absent")
+    test.assert(llmcretry.limits_of(["x-ratelimit-remaining-requests: many"]).requests_remaining == 0 - 1)
+    test.assert(llmcretry.limits_of(["anthropic-ratelimit-requests-remaining: many"]).requests_remaining == 0 - 1)
+    test.case("the reset that is waited for belongs to the bucket that is empty")
+    let policy = llmcretry.retry()
+    let rl = LlmcRateLimited(0 - 1, "m")
+    fn_delay_check(policy, rl, LlmcRateLimit { requests_remaining: 0,
+        tokens_remaining: 5,
+        requests_reset_ms: 4000,
+        tokens_reset_ms: 900,
+        retry_after_ms: 0 - 1 },
+    4000)
+    fn_delay_check(policy, rl, LlmcRateLimit { requests_remaining: 5,
+        tokens_remaining: 0,
+        requests_reset_ms: 4000,
+        tokens_reset_ms: 900,
+        retry_after_ms: 0 - 1 },
+    900)
+    fn_delay_check(policy, rl, LlmcRateLimit { requests_remaining: 0,
+        tokens_remaining: 0,
+        requests_reset_ms: 4000,
+        tokens_reset_ms: 9000,
+        retry_after_ms: 0 - 1 },
+    9000)
+    fn_delay_check(policy, rl, LlmcRateLimit { requests_remaining: 0,
+        tokens_remaining: 0,
+        requests_reset_ms: 9000,
+        tokens_reset_ms: 4000,
+        retry_after_ms: 0 - 1 },
+    9000)
+    fn_delay_check(policy, rl, LlmcRateLimit { requests_remaining: 5,
+        tokens_remaining: 5,
+        requests_reset_ms: 4000,
+        tokens_reset_ms: 900,
+        retry_after_ms: 0 - 1 },
+    4000)
+    test.case("the header beats the reset, and the fault's own delay beats both")
+    fn_delay_check(policy, rl, LlmcRateLimit { requests_remaining: 0,
+        tokens_remaining: 5,
+        requests_reset_ms: 4000,
+        tokens_reset_ms: 900,
+        retry_after_ms: 123 },
+    123)
+    fn_delay_check(policy, LlmcRateLimited(777, "m"), LlmcRateLimit { requests_remaining: 0,
+        tokens_remaining: 5,
+        requests_reset_ms: 4000,
+        tokens_reset_ms: 900,
+        retry_after_ms: 0 - 1 },
+    777)
+
+fn fn_delay_check(p: LlmcRetry, f: LlmcFault, limit: LlmcRateLimit, want: Int)
+    match llmcretry.next_delay_ms(p, 1, f, limit, 0.5)
+        Some(ms) => test.assert_eq(ms, want)
+        None     => test.fail("no delay")
+
+@test
+fn test_the_backoff_arithmetic_is_exact() [io]
+    let p = llmcretry.retry()
+    let boom = LlmcServerError(500, "m")
+    let none = llmcretry.no_limits()
+    test.case("full jitter under a doubling ceiling")
+    test.assert(llmcretry.next_delay_ms(p, 1, boom, none, 0.5) == Some(250))
+    test.assert(llmcretry.next_delay_ms(p, 2, boom, none, 0.5) == Some(500))
+    test.assert(llmcretry.next_delay_ms(p, 1, boom, none, 0.0) == Some(0))
+    test.assert(llmcretry.next_delay_ms(p, 1, boom, none, 0.999) == Some(499))
+    test.case("capped at the ceiling")
+    let wide = llmcretry.with_max_attempts(llmcretry.with_max_delay_ms(p, 2000), 20)
+    test.assert(llmcretry.next_delay_ms(wide, 3, boom, none, 0.5) == Some(1000))
+    test.assert(llmcretry.next_delay_ms(wide, 10, boom, none, 0.5) == Some(1000))
+    test.assert(llmcretry.next_delay_ms(llmcretry.with_max_delay_ms(p, 100), 1, boom, none, 0.5) == Some(50))
+    test.case("an overloaded provider is never retried at once")
+    test.assert(llmcretry.next_delay_ms(p, 1, LlmcOverloaded("m"), none, 0.0) == Some(250))
+    test.assert(llmcretry.next_delay_ms(p, 1, LlmcOverloaded("m"), none, 0.5) == Some(375))
+    test.case("the server's word is ignored only when the policy says so")
+    let deaf = LlmcRetry { max_attempts: 3, base_delay_ms: 500, max_delay_ms: 30000,
+                           respect_server_delay: false, idempotency_key: "" }
+    let told = LlmcRateLimit { requests_remaining: 0, tokens_remaining: 0, requests_reset_ms: 9000,
+                               tokens_reset_ms: 9000, retry_after_ms: 6000 }
+    test.assert(llmcretry.next_delay_ms(deaf, 1, LlmcRateLimited(5, "m"), told, 0.5) == Some(250))
+    test.case("the schedule stops where the attempts or the uniforms stop")
+    test.assert(llmcretry.schedule(p, boom, none, [0.5, 0.5, 0.5, 0.5]) == [250, 500])
+    test.assert(llmcretry.schedule(p, boom, none, [0.5]) == [250])
+    test.assert(list.len(llmcretry.schedule(p, LlmcAuthFailed(401, "m"), none, [0.5, 0.5])) == 0)
+    test.assert(llmcretry.should_retry(p, 2, boom))
+    test.assert(not llmcretry.should_retry(p, 3, boom))
+    test.assert(llmcretry.no_retry().max_attempts == 1)
+    test.assert(llmcretry.with_max_delay_ms(p, 7).max_delay_ms == 7)
+    test.assert(llmcretry.idempotency_headers(llmcretry.with_idempotency_key(p, "k1")) == ["Idempotency-Key: k1"])
+    test.assert(list.len(llmcretry.idempotency_headers(p)) == 0)
+    test.assert(llmcretry.deadline_passed(100, 50, 150))
+    test.assert(not llmcretry.deadline_passed(100, 50, 149))
+
+// ── the session calls ───────────────────────────────────────────────
+
+fn text_reply(text: Str) -> LlmcReply
+    reply_of(LlmcStopEnd, text, [])
+
+fn shaped_request(name: Str, schema: Str) -> LlmcRequest
+    let s = match json.parse(schema)
+        Some(v) => v
+        None    => json.null()
+    llmcreq.with_format(ask("m", [promptmsg.user("q")]), LlmcFormatSchema(name, s, true))
+
+@test
+fn test_a_reply_is_checked_against_the_schema_the_request_asked_for() [io]
+    let req = shaped_request("answer",
+        "{\"type\":\"object\",\"properties\":{\"n\":{\"type\":\"integer\"}},\"required\":[\"n\"]}")
+    test.assert(llmcchat.validate_format(req, text_reply("{\"n\":3}")) == Ok([]))
+    match llmcchat.validate_format(req, text_reply("{\"n\":\"three\"}"))
+        Ok(fs) =>
+            test.assert(list.len(fs) == 1)
+            test.assert(str.starts_with(fs[0], "/n: "))
+        Err(f) => test.fail(f.message())
+    match llmcchat.validate_format(req, text_reply("{}"))
+        Ok(fs) => test.assert(list.len(fs) == 1)
+        Err(f) => test.fail(f.message())
+    test.assert(llmcchat.validate_format(req, text_reply("not json")) == Ok(["the reply text is not JSON"]))
+    test.case("a schema that does not compile is the caller's error")
+    match llmcchat.validate_format(shaped_request("answer", "{\"type\": 5}"), text_reply("{}"))
+        Ok(_)  => test.fail("a bad schema validated")
+        Err(f) => test.assert(llmcfault.is_caller_error(f))
+    test.case("text asks for nothing, and bare JSON asks only for JSON")
+    test.assert(llmcchat.validate_format(ask("m", [promptmsg.user("q")]), text_reply("anything")) == Ok([]))
+    let bare = llmcreq.with_format(ask("m", [promptmsg.user("q")]), LlmcFormatJson)
+    test.assert(llmcchat.validate_format(bare, text_reply("[1]")) == Ok([]))
+    test.assert(llmcchat.validate_format(bare, text_reply("[1")) == Ok(["the reply text is not JSON"]))
+
+@test
+fn test_the_forced_schema_tool_is_put_back_in_the_text() [io]
+    let c = llmcchat.client(llmcreq.anthropic("k"))
+    let req = shaped_request("answer", "{\"type\":\"object\"}")
+    let forced = reply_of(LlmcStopToolUse, "", [call("t1", "answer", "{\"n\":3}")])
+    let settled = llmcchat.settle(c, req, forced)
+    test.assert_eq_str(settled.text, "{\"n\":3}")
+    test.assert(list.len(settled.tool_calls) == 0)
+    test.assert(llmcreply.is_complete(settled.stop))
+    test.case("other tools stay, and a second call by that name stays too")
+    let busy = reply_of(LlmcStopToolUse,
+        "x",
+        [call("t1", "answer", "{}"), call("t2", "other", "{}"), call("t3", "answer", "{}")])
+    let kept = llmcchat.settle(c, req, busy)
+    test.assert(list.len(kept.tool_calls) == 2 and kept.stop == LlmcStopToolUse)
+    test.case("no call by that name, another format, or the other dialect: untouched")
+    test.assert(llmcchat.settle(c, req, text_reply("plain")).text == "plain")
+    test.assert(llmcchat.settle(c, ask("m", [promptmsg.user("q")]), forced).text == "")
+    test.assert(llmcchat.settle(llmcchat.client(llmcreq.openai("k")), req, forced).text == "")
+
+@test
+fn test_the_client_encodes_decodes_and_describes_in_either_dialect() [io]
+    let oa = llmcchat.client(llmcreq.openai("sk-secret-secret"))
+    let an = llmcchat.client(llmcreq.anthropic("sk-ant-secret-secret"))
+    let req = ask("m", [promptmsg.user("q")])
+    match llmcchat.encode(an, req)
+        Ok(b)  => test.assert(str.contains(bytes.to_str(bytes.from_byte_list(ints(b))), "\"max_tokens\":100"))
+        Err(f) => test.fail(f.message())
+    match llmcchat.encode(oa, llmcreq.request("", promptmsg.convo([promptmsg.user("q")])))
+        Ok(_)  => test.fail("an unnamed model encoded")
+        Err(f) => test.assert(llmcfault.is_caller_error(f))
+    test.case("headers: the streaming Accept and the idempotency key")
+    let keyed = llmcchat.with_retry(an, llmcretry.with_idempotency_key(llmcretry.retry(), "k9"))
+    test.assert(llmcchat.headers_for(keyed, llmcreq.streaming(req)) == ["x-api-key: sk-ant-secret-secret",
+        "anthropic-version: 2023-06-01",
+        "Content-Type: application/json",
+        "Accept: text/event-stream",
+        "Idempotency-Key: k9"])
+    test.case("an Anthropic reply and an Anthropic error")
+    match llmcchat.decode(an,
+        200,
+        [],
+        chunk("{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"stop_reason\":\"end_turn\"}"))
+        Ok(r)  => test.assert(r.text == "hi")
+        Err(f) => test.fail(f.message())
+    match llmcchat.decode(an, 400, [], chunk("{\"error\":{\"type\":\"invalid_request_error\",\"message\":\"m\"}}"))
+        Ok(_)  => test.fail("a 400 decoded")
+        Err(f) => test.assert_eq_str(f.message(), "400 invalid_request_error: m")
+    test.case("a rate limit takes the delay from the headers, in either dialect")
+    match llmcchat.decode(oa, 429, ["Retry-After: 3"], chunk("{}"))
+        Ok(_)  => test.fail("a 429 decoded")
+        Err(f) => test.assert_eq_str(f.message(), "429 rate limited, retry after 3000 ms: {}")
+    test.case("frames decode in the client's dialect")
+    let frame = LlmcSseFrame { event: "ping", data: "{\"type\":\"ping\"}", id: "", retry_ms: 0 - 1 }
+    match llmcchat.decode_frame(an, frame)
+        Ok(es) => test.assert(list.len(es) == 1)
+        Err(f) => test.fail(f.message())
+    test.case("a streaming request is not sent as a single exchange")
+    test.assert_eq_str(llmcchat.describe(oa, llmcreq.streaming(req)),
+        "openai https://api.openai.com key=…cret model=m stream=true tools=0")
+    test.assert(llmcchat.with_deadline_ms(oa, 5).deadline_ms == 5)
+
+fn ints(b: [u8]) -> [Int]
+    list.map(b, x => x as Int)
+
+// A transport with nothing behind it, for the calls that fail before a
+// byte moves.
+struct Dead
+    status: Int
+    body: [u8]
+    headers: [Str]
+
+impl LlmcTransport[] for Dead
+    fn llmc_exchange(var self, method: Str, path: Str, headers: [Str],
+                     body: [u8]) -> Result<LlmcHttpReply, LlmcFault>
+        Ok(LlmcHttpReply { status: self.status,
+            headers: self.headers,
+            body: self.body,
+            streamed: false })
+
+    fn llmc_open(var self, method: Str, path: Str, headers: [Str],
+                 body: [u8]) -> Result<LlmcHttpReply, LlmcFault>
+        Ok(LlmcHttpReply { status: self.status, headers: self.headers, body: [], streamed: true })
+
+    fn llmc_read(var self, max: Int) -> Result<[u8], LlmcFault>
+        Ok([])
+
+    fn llmc_close(var self) -> ?LlmcFault
+        None
+
+@test
+fn test_calls_that_fail_before_a_byte_moves_and_a_stream_that_ends() [io, time]
+    let c = llmcchat.client(llmcreq.openai("k"))
+    let req = ask("m", [promptmsg.user("q")])
+    var dead = Dead { status: 200,
+        body: chunk("{\"choices\":[{\"message\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}"),
+        headers: [] }
+    test.case("send refuses a streaming request, and stream_open opens it")
+    match llmcchat.send(c, var dead, llmcreq.streaming(req))
+        Ok(_)  => test.fail("sent a stream as an exchange")
+        Err(f) => test.assert(llmcfault.is_caller_error(f))
+    match llmcchat.stream_open(c, var dead, req)
+        Ok(_)  => test.fail("a reply with no content type opened as a stream")
+        Err(f) => test.assert_eq_str(f.message(),
+            "this server, which answered content type none has no spelling for a streamed reply")
+    test.case("an error status that carries no error is still an error")
+    var odd = Dead { status: 500,
+        body: chunk("{\"choices\":[{\"message\":{\"content\":\"x\"},\"finish_reason\":\"stop\"}]}"),
+        headers: ["Content-Type: text/event-stream"] }
+    match llmcchat.stream_open(c, var odd, req)
+        Ok(_)  => test.fail("a 500 opened as a stream")
+        Err(f) => test.assert(llmcfault.is_retryable(f))
+    test.case("a stream that ended after its stop is not a truncation")
+    var live = Dead { status: 200, body: [], headers: ["Content-Type: text/event-stream"] }
+    match llmcchat.stream_open(c, var live, req)
+        Err(f) => test.fail(f.message())
+        Ok(s)  =>
+            let done = LlmcStreamState { reader: s.reader, dialect: s.dialect, read_bytes: 0,
+                                         acc: llmcsse.apply(s.acc, LlmcEventStop(LlmcStopEnd)) }
+            match llmcchat.stream_next(c, var live, done)
+                Err(f)   => test.fail(f.message())
+                Ok(step) => test.assert(list.len(step.events) == 0)
+    test.case("a retrying send gives up where the policy does, and where the deadline does")
+    var down = Dead { status: 503, body: chunk("{}"), headers: [] }
+    let once = llmcchat.with_retry(c, llmcretry.with_base_delay_ms(llmcretry.retry(), 1))
+    match llmcchat.send_retrying(once, var down, req, [0.0, 0.0, 0.0])
+        Ok(_)  => test.fail("a 503 succeeded")
+        Err(f) => test.assert_eq_str(f.message(), "503 the server failed: {}")
+    var unauthorized = Dead { status: 401, body: chunk("{}"), headers: [] }
+    match llmcchat.send_retrying(c, var unauthorized, req, [])
+        Ok(_)  => test.fail("a 401 succeeded")
+        Err(f) => test.assert(llmcfault.status_of(f) == 401)
+    let hurried = llmcchat.with_deadline_ms(llmcchat.with_retry(c, llmcretry.with_base_delay_ms(llmcretry.retry(), 10000)), 100)
+    match llmcchat.send_retrying(hurried, var down, req, [0.9])
+        Ok(_)  => test.fail("a 503 succeeded")
+        Err(f) => test.assert(str.starts_with(f.message(), "no reply within "))

@@ -12,12 +12,6 @@ type is the input, and on
 [tokenizers-nv](https://novo-lang.org/packages/tokenizers-nv) and
 [http-codec-nv](https://novo-lang.org/packages/http-codec-nv).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What it is
 
 A **provider** is a base URL, an API key and a **dialect**, which is which
@@ -42,6 +36,12 @@ input schema is the shape.
 **server-sent events**: a stream of frames, each a set of `field: value`
 lines, ending at a blank line. The format is the HTML Living Standard's
 `Server-sent events` section.
+
+**Where it runs.** The package is `host`: it has a transport in it. The
+two dialects, the reply, the event reader, the retry arithmetic and the
+faults are `[]` and use no host service, but this package makes no claim
+for a device, and a program that wants those halves on a microcontroller
+takes them from the modules directly.
 
 A **transport** is whatever carries the bytes. This package declares a
 trait for one and ships two implementations, and the effects a program
@@ -107,8 +107,8 @@ fn ask(key: Str, question: Str) -> Result<Str, LlmcFault> [net]
 
     // The type annotation is needed: `send` is generic over the
     // transport, and a binding written from `expr!` does not close it.
-    let t: LlmcTlsHttp = llmchttp.dial_tls(p, 30000)!
-    let reply = llmcchat.send(c, t, r)!
+    var t: LlmcTlsHttp = llmchttp.dial_tls(p, 30000)!
+    let reply = llmcchat.send(c, var t, r)!
 
     // How the reply ended, before its text is read: one that hit the
     // cap is a prefix that reads like a whole answer.
@@ -122,10 +122,9 @@ fn main() [io, net]
         Err(f)   => println(f.message())
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: llm-client-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`. The transport
+suite starts a stand-in chat API from `python3`, and makes its
+certificate with `openssl`, so both must be on the `PATH`.
 
 ## What the package contains
 
@@ -303,66 +302,45 @@ what a proxy, a recorder or a server needs.
 ## Tests
 
 ```bash
-novo test tests/llmcvalue_tests.nv    # 27 tests: providers, requests, replies, faults
-novo test tests/llmcwire_tests.nv     # 14 tests: the two dialects' bodies and errors
-novo test tests/llmcchat_tests.nv     # 14 tests: the client, the checks and the session
-novo test tests/llmcreply_tests.nv    # 11 tests: how a reply ended and what it owes
-novo test tests/llmcretry_tests.nv    # 14 tests: the headers, the backoff and the key
-novo test tests/llmcsse_tests.nv      # 10 tests: framing, `[DONE]`, and split arguments
+novo test tests/llmcvalue_tests.nv     # providers, requests, replies, faults
+novo test tests/llmcwire_tests.nv      # the two dialects' bodies and errors
+novo test tests/llmcopenai_tests.nv    # the OpenAI dialect against OpenAI's documented shapes
+novo test tests/llmcanthro_tests.nv    # the Anthropic dialect against Anthropic's documented shapes
+novo test tests/llmcchat_tests.nv      # the client over an in-memory transport
+novo test tests/llmcreply_tests.nv     # how a reply ended and what it owes
+novo test tests/llmcretry_tests.nv     # the headers, the backoff and the key
+novo test tests/llmcsse_tests.nv       # framing, `[DONE]`, and split arguments
+novo test tests/llmcedge_tests.nv      # the boundaries: faults, SSE grammar, checks, dates, durations
+novo test tests/llmcnet_tests.nv       # both transports against a stand-in server
+bash tests/coverage.sh                 # the merged line coverage over src/
 ```
 
-The request bodies and the reply shapes are the two published API
-references. The stream framing is the HTML Living Standard's server-sent
-events section. The retry headers are `Retry-After` and the providers'
-documented reset headers.
+The expected values are written out by hand from the published sources, not
+produced by this package. The request bodies and the reply and stream
+shapes are the examples in OpenAI's and Anthropic's API references. The
+SSE grammar is the HTML Living Standard's server-sent events section. The
+HTTP date is RFC 9110's own example, and the duration spellings are Go's
+`time.ParseDuration`, which is what OpenAI's rate-limit headers use.
 
-The suite asserts the three quiet mistakes a stream reader makes: a frame
-that ends at a newline rather than a blank line, `[DONE]` parsed as JSON,
-and tool-call arguments parsed before they are whole. Because the jitter
-takes its uniforms as arguments, `llmcretry_tests.nv` asserts exact delays
-rather than ranges.
+The transport suite is checked against an HTTP implementation this package
+shares no code with. `tests/fixtures/llmc_server.py` is Python's own
+HTTP server on loopback, plain and over TLS, and each test starts one. It
+answers what it received, so the suite asserts the framing, headers and
+body that `http-codec-nv` and the standard library's client actually put
+on the wire. It also chunks, stalls, closes early, sends a `100 Continue`,
+sends trailers and sends bytes that are not HTTP.
 
-The tests compile today and fail at run, each on the
-`not implemented: llm-client-nv.<module>.<fn>` panic that is its body. That
-is the expected state of an interface release. They turn green one at a
-time as bodies land.
+Because the jitter takes its uniforms as arguments, `llmcretry_tests.nv`
+asserts exact delays rather than ranges. Line coverage over `src/` is 100%.
 
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `llmcreq.dialect_name`, `.dialect_of_name` | no |
-| `llmcreq.openai`, `.anthropic`, `.compatible`, `.with_base_url`, `.with_header`, `.with_api_version` | no |
-| `llmcreq.provider_base_url`, `.key_is_set`, `.redacted`, `.chat_path`, `.auth_headers` | no |
-| `llmcreq.tool`, `.params`, `.with_max_tokens`, `.with_temperature`, `.with_top_p`, `.with_stop`, `.with_seed` | no |
-| `llmcreq.request`, `.with_tools`, `.with_tool_choice`, `.with_format`, `.with_params`, `.streaming` | no |
-| `llmcreq.check`, `.is_tool_name` | no |
-| `llmcreq.request_tokens`, `.tools_tokens`, `.check_budget` | no |
-| `llmcreply.is_complete`, `.stop_note`, `.stop_of_openai`, `.stop_of_anthropic` | no |
-| `llmcreply.arguments_json`, `.no_usage`, `.total_tokens`, `.add_usage`, `.empty_reply` | no |
-| `llmcreply.owed_tool_results`, `.unanswered`, `.call_by_id`, `.wants_tools`, `.is_truncated`, `.json_of` | no |
-| `llmcreply.to_message`, `.to_messages` | no |
-| `llmcopenai`'s three constants | yes (they are constants) |
-| `llmcopenai.encode_request`, `.encode_body`, `.encode_message`, `.encode_messages` | no |
-| `llmcopenai.encode_tool`, `.encode_tool_choice`, `.encode_format`, `.assistant_turn`, `.tool_result_message` | no |
-| `llmcopenai.decode_reply`, `.decode_value`, `.decode_usage`, `.decode_error`, `.events_of_frame`, `.is_model_name` | no |
-| `llmcanthro`'s three constants | yes (they are constants) |
-| `llmcanthro.encode_request`, `.encode_body`, `.encode_system`, `.encode_messages`, `.encode_message` | no |
-| `llmcanthro.encode_tool`, `.encode_tool_choice`, `.encode_format`, `.assistant_turn`, `.tool_result_message` | no |
-| `llmcanthro.decode_reply`, `.decode_value`, `.blocks_of`, `.decode_usage`, `.decode_error`, `.events_of_frame`, `.is_model_name` | no |
-| `llmcsse.reader`, `.reader_with`, `.feed`, `.take`, `.pending_len`, `.is_done` | no |
-| `llmcsse.stream`, `.apply`, `.apply_all`, `.finished`, `.partial`, `.finish`, `.text_delta` | no |
-| `llmcretry.retry`, `.no_retry`, `.with_max_attempts`, `.with_base_delay_ms`, `.with_max_delay_ms`, `.with_idempotency_key` | no |
-| `llmcretry.no_limits`, `.limits_of`, `.parse_duration_ms`, `.retry_after_from` | no |
-| `llmcretry.should_retry`, `.next_delay_ms`, `.schedule`, `.idempotency_headers` | no |
-| `llmcretry.now_ms`, `.elapsed_ms`, `.deadline_passed` | no |
-| `llmchttp.std_http`, `.dial_tls`, `.origin_of`, `.header_of`, `.is_event_stream` | no |
-| `LlmcTransport` for `LlmcStdHttp` and for `LlmcTlsHttp`: all four methods | no |
-| `llmcchat.client`, `.with_retry`, `.with_deadline_ms`, `.describe` | no |
-| `llmcchat.encode`, `.headers_for`, `.decode`, `.decode_frame` | no |
-| `llmcchat.send`, `.send_retrying`, `.stream_open`, `.stream_next` | no |
-| `llmcchat.validate_format`, `.append_reply`, `.append_tool_result` | no |
-| `llmcfault.is_retryable`, `.is_caller_error`, `.status_of`, `.of_status`, `.with_retry_after`, `LlmcFault.message` | no |
+Two things in the transport suite are not this package's. A TLS read that
+fails leaks its receive buffer in the runtime
+(`tls-recv-leaks-its-receive-buffer-when-the-read-fails`), so three tests
+that read a connection until the peer closes pass their assertions and
+fail the run's leak check. And the standard library's streaming reader
+returns the chunk framing of a chunked body
+(`http-reply-reader-read-hands-back-the-chunk-framing-of-a-chunked-body`),
+so `LlmcStdHttp` decodes the chunks itself.
 
 ## Licence
 

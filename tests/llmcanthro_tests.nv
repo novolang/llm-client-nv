@@ -1,0 +1,303 @@
+// llmcanthro_tests.nv — Anthropic's Messages dialect against the wire
+// shapes Anthropic documents (Messages, tool use, streaming, errors).
+//
+// The expected JSON and the stream below are written out by hand from
+// those pages, not produced by this package; the streaming transcript
+// is the documented example of a basic text stream.
+
+use std.test
+use std.json
+use std.list
+use llmcanthro
+use llmcreq
+use llmcreply
+use llmcsse
+use llmcfault
+use promptmsg
+
+fn same(v: JsonValueH, expected: Str) -> Bool
+    match json.parse(expected)
+        Some(e) => json.equals(v, e)
+        None    => false
+
+fn hello() -> PromptConvo
+    promptmsg.convo([promptmsg.system_message("Be brief."), promptmsg.user("Hello, Claude")])
+
+fn capped() -> LlmcParams
+    llmcreq.with_max_tokens(llmcreq.params(), 1024)
+
+fn encoded(r: LlmcRequest) -> JsonValueH
+    match llmcanthro.encode_request(llmcreq.anthropic("sk-ant"), r)
+        Ok(v)  => v
+        Err(f) => json.string(f.message())
+
+@test
+fn test_the_documented_minimal_request() [io]
+    let r = llmcreq.with_params(llmcreq.request("claude-haiku-4-5", hello()), capped())
+    test.assert(same(encoded(r),
+        "{\"model\":\"claude-haiku-4-5\",\"max_tokens\":1024,\"system\":\"Be brief.\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello, Claude\"}]}"))
+    match llmcanthro.encode_body(llmcreq.anthropic("sk-ant"), r)
+        Ok(s)  => test.assert(s == json.stringify(encoded(r)))
+        Err(f) => test.fail(f.message())
+    test.case("no system message, no system field")
+    let bare = llmcreq.with_params(llmcreq.request("m", promptmsg.convo([promptmsg.user("x")])), capped())
+    test.assert(json.get(encoded(bare), "system") == None)
+    test.assert(llmcanthro.encode_system(promptmsg.convo([promptmsg.user("x")])) == "")
+
+@test
+fn test_sampling_and_streaming_use_anthropic_names() [io]
+    let p = llmcreq.with_stop(llmcreq.with_top_p(llmcreq.with_temperature(capped(), 0.5), 0.8), ["</answer>"])
+    let r = llmcreq.streaming(llmcreq.with_params(llmcreq.request("m", hello()), p))
+    let v = encoded(r)
+    test.assert(same(v,
+        "{\"model\":\"m\",\"max_tokens\":1024,\"system\":\"Be brief.\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello, Claude\"}],\"temperature\":0.5,\"top_p\":0.8,\"stop_sequences\":[\"</answer>\"],\"stream\":true}"))
+
+@test
+fn test_tools_choices_and_the_schema_tool() [io]
+    let weather = llmcreq.tool("get_weather", "Get the weather", json.object([("type", json.string("object"))]))
+    test.assert(same(llmcanthro.encode_tool(weather),
+        "{\"name\":\"get_weather\",\"description\":\"Get the weather\",\"input_schema\":{\"type\":\"object\"}}"))
+    test.assert(same(llmcanthro.encode_tool_choice(LlmcToolAuto), "{\"type\":\"auto\"}"))
+    test.assert(same(llmcanthro.encode_tool_choice(LlmcToolNone), "{\"type\":\"none\"}"))
+    test.assert(same(llmcanthro.encode_tool_choice(LlmcToolRequired), "{\"type\":\"any\"}"))
+    test.assert(same(llmcanthro.encode_tool_choice(LlmcToolNamed("get_weather")),
+        "{\"type\":\"tool\",\"name\":\"get_weather\"}"))
+
+    test.case("tools with a forced choice")
+    let forced = llmcreq.with_tool_choice(llmcreq.with_tools(llmcreq.with_params(llmcreq.request("m", hello()), capped()), [weather]),
+        LlmcToolRequired)
+    test.assert(same(encoded(forced),
+        "{\"model\":\"m\",\"max_tokens\":1024,\"system\":\"Be brief.\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello, Claude\"}],\"tools\":[{\"name\":\"get_weather\",\"description\":\"Get the weather\",\"input_schema\":{\"type\":\"object\"}}],\"tool_choice\":{\"type\":\"any\"}}"))
+    test.case("tools with the default choice send no tool_choice")
+    let auto = llmcreq.with_tools(llmcreq.with_params(llmcreq.request("m", hello()), capped()), [weather])
+    test.assert(json.get(encoded(auto), "tool_choice") == None)
+
+    test.case("a schema becomes one forced tool")
+    let shaped = llmcreq.with_format(llmcreq.with_params(llmcreq.request("m", hello()), capped()),
+                                     LlmcFormatSchema("answer", json.object([("type", json.string("object"))]), true))
+    let v = encoded(shaped)
+    test.assert(same(json.get(v, "tool_choice") ?? json.null(), "{\"type\":\"tool\",\"name\":\"answer\"}"))
+    test.assert(json.len(json.get(v, "tools") ?? json.null()) == Some(1))
+    match llmcanthro.encode_format(LlmcFormatText)
+        Ok(f)  => test.assert(json.is_null(f))
+        Err(f) => test.fail(f.message())
+    match llmcanthro.encode_format(LlmcFormatJson)
+        Ok(_)  => test.fail("json with no schema encoded")
+        Err(f) => test.assert_eq_str(f.message(), "anthropic has no spelling for a JSON response format with no schema")
+    match llmcanthro.encode_request(llmcreq.anthropic("k"),
+        llmcreq.with_format(llmcreq.with_params(llmcreq.request("m", hello()), capped()), LlmcFormatJson))
+        Ok(_)  => test.fail("json with no schema encoded")
+        Err(_) => test.assert(true)
+
+fn calls_convo() -> PromptConvo
+    promptmsg.convo([promptmsg.user("weather?"),
+                     promptmsg.assistant("let me look"),
+                     PromptMessage { role: PromptAssistant, text: "{\"city\":\"Copenhagen\"}",
+                                     name: "get_weather", call_id: "toolu_a" },
+                     PromptMessage { role: PromptAssistant, text: "not json",
+                                     name: "get_weather", call_id: "toolu_b" },
+                     promptmsg.tool_result("get_weather", "toolu_a", "12 C"),
+                     promptmsg.tool_result("get_weather", "toolu_b", "8 C"),
+                     promptmsg.user("thanks")])
+
+@test
+fn test_tool_turns_are_blocks_and_results_share_one_user_message() [io]
+    match llmcanthro.encode_messages(calls_convo())
+        Err(f) => test.fail(f.message())
+        Ok(v)  =>
+            test.assert(same(v,
+                "[{\"role\":\"user\",\"content\":\"weather?\"},{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"let me look\"},{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"get_weather\",\"input\":{\"city\":\"Copenhagen\"}},{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"get_weather\",\"input\":{}}]},{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a\",\"content\":\"12 C\"},{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_b\",\"content\":\"8 C\"}]},{\"role\":\"user\",\"content\":\"thanks\"}]"))
+    test.case("a call after a user message does not borrow its text, a call alone is one block")
+    let odd = promptmsg.convo([promptmsg.user("x"),
+                               PromptMessage { role: PromptAssistant, text: "{}", name: "now", call_id: "t1" }])
+    match llmcanthro.encode_messages(odd)
+        Err(f) => test.fail(f.message())
+        Ok(v)  => test.assert(json.len(v) == Some(2))
+    match llmcanthro.encode_message(PromptMessage { role: PromptAssistant, text: "{}", name: "now", call_id: "t1" })
+        Ok(v)  => test.assert(same(v,
+            "{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"now\",\"input\":{}}]}"))
+        Err(f) => test.fail(f.message())
+    test.case("a system message has no place in the array, a result needs its id")
+    match llmcanthro.encode_message(promptmsg.system_message("s"))
+        Ok(_)  => test.fail("a system message encoded")
+        Err(f) => test.assert(llmcfault.is_caller_error(f))
+    match llmcanthro.encode_message(promptmsg.tool_result("now", "", "noon"))
+        Ok(_)  => test.fail("a result with no id encoded")
+        Err(f) => test.assert(llmcfault.is_caller_error(f))
+    match llmcanthro.encode_message(promptmsg.tool_result("now", "t1", "noon"))
+        Ok(v)  => test.assert(same(v,
+            "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"noon\"}]}"))
+        Err(f) => test.fail(f.message())
+    match llmcanthro.encode_message(promptmsg.assistant("hi"))
+        Ok(v)  => test.assert(same(v, "{\"role\":\"assistant\",\"content\":\"hi\"}"))
+        Err(f) => test.fail(f.message())
+    test.case("a failed tool says so, and the lossless turn keeps the order")
+    test.assert(same(llmcanthro.tool_result_message("t1", "boom", true),
+        "{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"boom\",\"is_error\":true}]}"))
+    let reply = LlmcReply { stop: LlmcStopToolUse, text: "hm", usage: llmcreply.no_usage(), model: "", id: "",
+                            tool_calls: [LlmcToolCall { id: "t1", name: "now", arguments: "{}" }] }
+    test.assert(same(llmcanthro.assistant_turn(reply),
+        "{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"hm\"},{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"now\",\"input\":{}}]}"))
+
+@test
+fn test_the_documented_response_decodes() [io]
+    let body = "{\"id\":\"msg_01XFDUDYJgAACzvnptvVoYEL\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Let me check. \"},{\"type\":\"tool_use\",\"id\":\"toolu_01A\",\"name\":\"get_weather\",\"input\":{\"location\":\"SF\"}},{\"type\":\"text\",\"text\":\"Done.\"}],\"model\":\"claude-sonnet-4-5\",\"stop_reason\":\"tool_use\",\"stop_sequence\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":6,\"cache_creation_input_tokens\":100,\"cache_read_input_tokens\":50}}"
+    match llmcanthro.decode_reply(body)
+        Err(f) => test.fail(f.message())
+        Ok(r)  =>
+            test.assert(r.text == "Let me check. Done.")
+            test.assert(r.id == "msg_01XFDUDYJgAACzvnptvVoYEL")
+            test.assert(r.tool_calls[0].arguments == "{\"location\":\"SF\"}")
+            test.assert(llmcreply.wants_tools(r))
+            test.assert(list.len(llmcreply.owed_tool_results(r)) == 1)
+            test.case("the whole input is the three counts added; only the read part is cached")
+            test.assert(r.usage.input_tokens == 162)
+            test.assert(r.usage.cached_input_tokens == 50)
+            test.assert(r.usage.output_tokens == 6)
+    match json.parse(body)
+        Some(v) => test.assert(list.len(llmcanthro.blocks_of(v)) == 3)
+        None    => test.fail("body")
+    test.case("no content list is malformed, a bad body is malformed")
+    match llmcanthro.decode_reply("{\"id\":\"x\"}")
+        Ok(_)  => test.fail("decoded")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no content")
+    match llmcanthro.decode_reply("nope")
+        Ok(_)  => test.fail("decoded")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no body as JSON")
+    test.case("a tool_use with no input, a block kind this client does not know")
+    match llmcanthro.decode_reply("{\"content\":[{\"type\":\"tool_use\",\"id\":\"t\",\"name\":\"n\"},{\"type\":\"thinking\",\"thinking\":\"..\"}],\"stop_reason\":\"refusal\"}")
+        Ok(r)  =>
+            test.assert(r.tool_calls[0].arguments == "{}")
+            test.assert(not llmcreply.is_complete(r.stop))
+        Err(f) => test.fail(f.message())
+
+@test
+fn test_documented_errors_become_the_right_faults() [io]
+    test.assert_eq_str(llmcanthro.decode_error(401,
+        "{\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"invalid x-api-key\"}}").message(),
+    "401 the key was refused: invalid x-api-key")
+    test.assert_eq_str(llmcanthro.decode_error(400,
+        "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"max_tokens: Field required\"}}").message(),
+    "400 invalid_request_error: max_tokens: Field required")
+    test.assert_eq_str(llmcanthro.decode_error(529,
+        "{\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}").message(),
+    "the provider is at capacity: Overloaded")
+    test.assert(llmcfault.is_retryable(llmcanthro.decode_error(529, "")))
+    test.assert_eq_str(llmcanthro.decode_error(500, "").message(), "500 the server failed: the response had no body")
+    test.assert_eq_str(llmcanthro.decode_error(502, "oops").message(), "502 the server failed: oops")
+
+fn frame(event: Str, data: Str) -> LlmcSseFrame
+    LlmcSseFrame { event: event, data: data, id: "", retry_ms: 0 - 1 }
+
+fn fold(frames: [LlmcSseFrame]) -> LlmcStream
+    var s = llmcsse.stream()
+    for f in frames
+        match llmcanthro.events_of_frame(f)
+            Ok(es) =>
+                s = llmcsse.apply_all(s, es)
+            Err(_) => 0
+    s
+
+@test
+fn test_the_documented_basic_stream_folds_to_one_reply() [io]
+    let s = fold([
+        frame("message_start",
+        "{\"type\": \"message_start\", \"message\": {\"id\": \"msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY\", \"type\": \"message\", \"role\": \"assistant\", \"content\": [], \"model\": \"claude-sonnet-4-5\", \"stop_reason\": null, \"stop_sequence\": null, \"usage\": {\"input_tokens\": 25, \"output_tokens\": 1}}}"),
+        frame("content_block_start",
+        "{\"type\": \"content_block_start\", \"index\": 0, \"content_block\": {\"type\": \"text\", \"text\": \"\"}}"),
+        frame("ping", "{\"type\": \"ping\"}"),
+        frame("content_block_delta",
+        "{\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"Hello\"}}"),
+        frame("content_block_delta",
+        "{\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"!\"}}"),
+        frame("content_block_stop", "{\"type\": \"content_block_stop\", \"index\": 0}"),
+        frame("message_delta",
+        "{\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"max_tokens\", \"stop_sequence\":null}, \"usage\": {\"output_tokens\": 15}}"),
+        frame("message_stop", "{\"type\": \"message_stop\"}")])
+    match llmcsse.finish(s)
+        Err(f) => test.fail(f.message())
+        Ok(r)  =>
+            test.assert(r.text == "Hello!")
+            test.assert(r.id == "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY")
+            test.assert(r.model == "claude-sonnet-4-5")
+            test.case("usage merges: the input from the start, the output from the end")
+            test.assert(r.usage.input_tokens == 25)
+            test.assert(r.usage.output_tokens == 15)
+            test.case("the reason named by message_delta is not overwritten by the bare message_stop")
+            test.assert(llmcreply.is_truncated(r))
+
+@test
+fn test_a_streamed_tool_call_and_the_other_frames() [io]
+    let s = fold([
+        frame("message_start",
+        "{\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"model\":\"x\",\"usage\":{\"input_tokens\":3}}}"),
+        frame("content_block_start",
+        "{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"Looking. \"}}"),
+        frame("content_block_start",
+        "{\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{}}}"),
+        frame("content_block_delta",
+        "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"\"}}"),
+        frame("content_block_delta",
+        "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"loc\"}}"),
+        frame("content_block_delta",
+        "{\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"ation\\\": \\\"SF\\\"}\"}}"),
+        frame("content_block_delta",
+        "{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"..\"}}"),
+        frame("content_block_stop", "{\"type\":\"content_block_stop\",\"index\":1}"),
+        frame("some_future_event", "{\"type\":\"some_future_event\"}"),
+        frame("message_delta",
+        "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":40}}"),
+        frame("message_stop", "{}")])
+    match llmcsse.finish(s)
+        Err(f) => test.fail(f.message())
+        Ok(r)  =>
+            test.assert(r.text == "Looking. ")
+            test.assert(list.len(r.tool_calls) == 1)
+            test.assert(r.tool_calls[0].id == "toolu_1")
+            test.assert(r.tool_calls[0].arguments == "{\"location\": \"SF\"}")
+            test.assert(llmcreply.wants_tools(r))
+    test.case("a frame named only in its data is read by the data's type")
+    match llmcanthro.events_of_frame(frame("", "{\"type\":\"ping\"}"))
+        Ok(es) => test.assert(list.len(es) == 1)
+        Err(f) => test.fail(f.message())
+    test.case("a stop_sequence names which one fired")
+    let stopped = fold([frame("message_delta",
+        "{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"stop_sequence\",\"stop_sequence\":\"</a>\"}}")])
+    match llmcsse.partial(stopped).stop
+        LlmcStopSequence(which) => test.assert(which == "</a>")
+        _                       => test.fail("no stop sequence")
+    test.case("a message_delta that names no stop only carries usage")
+    let usage_only = fold([frame("message_delta", "{\"type\":\"message_delta\",\"delta\":{},\"usage\":{\"output_tokens\":9}}")])
+    test.assert(not llmcsse.finished(usage_only))
+    test.assert(llmcsse.partial(usage_only).usage.output_tokens == 9)
+    test.case("junk data is malformed")
+    match llmcanthro.events_of_frame(frame("message_start", "{nope"))
+        Ok(_)  => test.fail("junk decoded")
+        Err(f) => test.assert_eq_str(f.message(), "the reply had no stream event as JSON")
+
+@test
+fn test_a_stream_error_event_is_the_fault_it_names() [io]
+    test.assert_eq_str(error_of("overloaded_error"), "the provider is at capacity: boom")
+    test.assert_eq_str(error_of("rate_limit_error"), "429 rate limited, retry after -1 ms: boom")
+    test.assert_eq_str(error_of("authentication_error"), "401 the key was refused: boom")
+    test.assert_eq_str(error_of("permission_error"), "401 the key was refused: boom")
+    test.assert_eq_str(error_of("invalid_request_error"), "400 invalid_request_error: boom")
+    test.assert_eq_str(error_of("not_found_error"), "400 not_found_error: boom")
+    test.assert_eq_str(error_of("api_error"), "500 the server failed: boom")
+    match llmcanthro.events_of_frame(frame("error", "{\"type\":\"error\",\"error\":{\"type\":\"api_error\"}}"))
+        Ok(_)  => test.fail("an error event decoded")
+        Err(f) => test.assert_eq_str(f.message(), "500 the server failed: the stream reported an error")
+
+fn error_of(kind: Str) -> Str
+    match llmcanthro.events_of_frame(frame("error", "{\"type\":\"error\",\"error\":{\"type\":\"${kind}\",\"message\":\"boom\"}}"))
+        Ok(_)  => "decoded"
+        Err(f) => f.message()
+
+@test
+fn test_model_names_and_constants() [io]
+    test.assert(llmcanthro.is_model_name("claude-haiku-4-5"))
+    test.assert(not llmcanthro.is_model_name("anthropic:claude-haiku-4-5"))
+    test.assert(not llmcanthro.is_model_name(""))
+    test.assert(llmcanthro.LLMC_ANTHROPIC_VERSION == llmcreq.anthropic("").api_version)
+    test.assert(llmcanthro.LLMC_ANTHROPIC_BASE_URL == llmcreq.provider_base_url(llmcreq.anthropic("")))
+    test.assert(llmcanthro.LLMC_ANTHROPIC_CHAT_PATH == llmcreq.chat_path(llmcreq.anthropic("")))

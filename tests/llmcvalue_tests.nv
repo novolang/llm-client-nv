@@ -1,10 +1,6 @@
 // llmcvalue_tests.nv — the values a caller builds before anything is
 // sent, and the accessors it reads afterwards.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// llm-client-nv.<module>.<fn>`.
-//
 // The coarse suite: one test per area, asserting the contract each
 // area states in its doc comments.  The fine-grained behaviour is in
 // the other four files; this one is the shape that says a public name

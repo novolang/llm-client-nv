@@ -1,9 +1,5 @@
 // llmcsse_tests.nv — the streamed reply, with no socket in the file.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// llm-client-nv.<module>.<fn>`.
-//
 // A whole stream is a byte array here, which is `llmcsse`'s claim
 // working: the reader is feed-and-drain and `[]`, so the loop that
 // would have been a socket is a `for` over three chunks.
