@@ -116,13 +116,6 @@ pub struct LlmcTlsHttp
 pub struct LlmcLive
     conn: HttpConn
     reader: HttpReplyReader
-    // Whether the body is chunked.  `HttpReplyReader.read` hands back
-    // the chunk framing as it arrived, so a chunked body is decoded
-    // here, by http-codec-nv's reader.
-    chunked: Bool
-    decoder: H1Reader
-    // The chunked body ended.
-    done: Bool
 
 // A TLS connection, the response reader over it and the body bytes a
 // `llmc_read` has been handed and not yet returned.
@@ -324,54 +317,32 @@ impl LlmcTransport[io, net, time, async] for LlmcStdHttp
 
     fn llmc_open(var self, method: Str, path: Str, headers: [Str],
                  body: [u8]) -> Result<LlmcHttpReply, LlmcFault> [io, net, time, async]
-        // workaround(a-method-call-on-a-struct-field-leaks-the-receiver):
-        // `self.client.connect()` leaks the connection it opens.
-        let client = self.client
-        match client.connect()
-            Err(e) => Err(std_fault(e, client.timeout_ms))
+        match self.client.connect()
+            Err(e) => Err(std_fault(e, self.client.timeout_ms))
             Ok(k)  =>
                 match k.open(method, path, headers, bytes.from_byte_list(as_ints(body)))
-                    Err(e)    => Err(std_fault(e, client.timeout_ms))
+                    Err(e)    => Err(std_fault(e, self.client.timeout_ms))
                     Ok(reply) =>
-                        let primed = chunk_decoder()!
-                        list.push(self.live, LlmcLive { conn: k, reader: k.reader(reply),
-                                                        chunked: reply.chunked,
-                                                        decoder: primed, done: false })
+                        list.push(self.live, LlmcLive { conn: k, reader: k.reader(reply) })
                         Ok(LlmcHttpReply { status: reply.status, headers: reply.headers,
                                            body: [], streamed: true })
 
     fn llmc_read(var self, max: Int) -> Result<[u8], LlmcFault> [io, net, time, async]
         if list.len(self.live) == 0
             return Err(LlmcTransportFailed("llmc_read before llmc_open"))
+        // workaround(a-trait-method-call-on-a-field-of-a-list-element-leaks-the-receiver):
+        // `self.live[0].reader.read(max)` leaks two objects per read, so
+        // the element and its field are bound first.
         let w = self.live[0]
-        if w.done
-            return Ok([])
-        var decoder = w.decoder
-        // workaround(a-method-call-on-a-struct-field-leaks-the-receiver)
         let reader = w.reader
-        loop
-            match reader.read(max)
-                Err(e)    =>
-                    return Err(LlmcTransportFailed("reading the body: ${e.message()}"))
-                Ok(chunk) =>
-                    let raw = bytes.to_byte_list(chunk)
-                    if not w.chunked or list.len(raw) == 0
-                        return Ok(raw)
-                    // Decoding only removes bytes, so what comes out is
-                    // never more than the `max` that was read.
-                    let got = decode_chunks(decoder, raw)!
-                    decoder = got.reader
-                    self.live[0] = LlmcLive { conn: w.conn, reader: w.reader, chunked: true,
-                                              decoder: decoder, done: got.done }
-                    if list.len(got.data) > 0 or got.done
-                        return Ok(got.data[:])
+        match reader.read(max)
+            Err(e)    => Err(LlmcTransportFailed("reading the body: ${e.message()}"))
+            Ok(chunk) => Ok(bytes.to_byte_list(chunk))
 
     fn llmc_close(var self) -> ?LlmcFault [io, net, time, async]
         if list.len(self.live) == 0
             return None
-        // workaround(a-method-call-on-a-struct-field-leaks-the-receiver)
-        let k = self.live[0].conn
-        k.close()
+        self.live[0].conn.close()
         None
 
 // TLS plus http-codec-nv as a transport.
@@ -550,11 +521,9 @@ fn next_event(conn: Int, rd: H1Reader, timeout_ms: Int) -> Result<LlmcWireEvent,
             Some(chunk) =>
                 step = decoded(h1read.feed(step.reader, bytes.to_byte_list(chunk)))!
             None        =>
-                let why = tls.last_error()
-                // workaround(tls-recv-cannot-tell-a-receive-deadline-from-an-abrupt-close):
-                // an empty read is a close when the detail says the peer
-                // ended, and a receive deadline otherwise.
-                if why != "" and not str.contains(why, "eof") and not str.contains(why, "peer closed")
+                // The runtime names a receive deadline; any other empty
+                // read is the peer closing, with or without a close_notify.
+                if str.contains(tls.last_error(), "receive deadline")
                     return Err(LlmcTimedOut(timeout_ms))
                 step = decoded(h1read.finish(step.reader))!
 
@@ -575,41 +544,3 @@ fn hand_out(var t: LlmcTlsHttp, w: LlmcWire, data: [u8], max: Int) -> [u8]
         return data[:]
     t.wire[0] = LlmcWire { conn: w.conn, reader: w.reader, held: data[max:], done: w.done, used: w.used }
     data[0:max]
-
-// A response reader primed with a chunked 200 head, so that body bytes
-// fed to it come out with the chunk framing removed.
-//
-// workaround(http-reply-reader-read-hands-back-the-chunk-framing-of-a-chunked-body): the
-// standard library's `HttpReplyReader.read` hands back a chunked body
-// with its size lines in it.  Drop this and read directly when that is
-// fixed.
-fn chunk_decoder() -> Result<H1Reader, LlmcFault>
-    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
-    let fresh = h1read.expect(h1read.reader(ReadsResponses, h1read.default_limits()), Post)
-    Ok(decoded(h1read.feed(fresh, bytes.to_byte_list(bytes.from_str(head))))!.reader)
-
-// What a decoder produced from some raw bytes.
-struct LlmcDecoded
-    reader: H1Reader
-    data: [u8]
-    done: Bool
-
-// Feed raw body bytes to a chunk decoder and collect what it releases.
-fn decode_chunks(rd: H1Reader, raw: [u8]) -> Result<LlmcDecoded, LlmcFault>
-    var cur = rd
-    var data: [u8] = []
-    var done = false
-    var step = decoded(h1read.feed(cur, raw))!
-    loop
-        cur = step.reader
-        match step.event
-            Some(BodyBytes(d)) =>
-                for b in d
-                    list.push(data, b)
-            Some(MessageDone)  =>
-                done = true
-            Some(_)            => 0
-            None               =>
-                break
-        step = decoded(h1read.take(cur))!
-    Ok(LlmcDecoded { reader: cur, data: data, done: done })

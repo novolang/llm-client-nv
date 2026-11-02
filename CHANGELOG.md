@@ -14,6 +14,11 @@ are green, line coverage over `src/` is 100%, and the expected values are
 written by hand from the published API references, not produced by this
 package.
 
+The standard-library transport streams a chunked body through
+`HttpReplyReader.read`, which decodes the framing from novo 0.22.1; the
+package no longer decodes it a second time, and the manifest asks for
+that compiler.
+
 ### Breaking, against the 0.0.3 interface
 
 - **`LlmcTransport`'s four methods take `var self`**, and `send`,
