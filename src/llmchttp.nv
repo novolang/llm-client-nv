@@ -330,12 +330,7 @@ impl LlmcTransport[io, net, time, async] for LlmcStdHttp
     fn llmc_read(var self, max: Int) -> Result<[u8], LlmcFault> [io, net, time, async]
         if list.len(self.live) == 0
             return Err(LlmcTransportFailed("llmc_read before llmc_open"))
-        // workaround(a-trait-method-call-on-a-field-of-a-list-element-leaks-the-receiver):
-        // `self.live[0].reader.read(max)` leaks two objects per read, so
-        // the element and its field are bound first.
-        let w = self.live[0]
-        let reader = w.reader
-        match reader.read(max)
+        match self.live[0].reader.read(max)
             Err(e)    => Err(LlmcTransportFailed("reading the body: ${e.message()}"))
             Ok(chunk) => Ok(bytes.to_byte_list(chunk))
 
