@@ -26,7 +26,7 @@ category    = "ai"
 tags        = ["llm", "openai", "anthropic", "chat", "tool-calling", "streaming", "sse"]
 repository  = "https://github.com/novolang/llm-client-nv"
 maintainers = ["novo-lang"]
-novo        = ">= 0.22.1"
+novo        = ">= 0.23.0"
 
 # A library: no `main`, so `novo pkg build` type-checks and
 # effect-checks every module under `src/` and writes no binary.

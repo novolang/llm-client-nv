@@ -114,6 +114,12 @@ that compiler.
   deadline otherwise; the site carries the workaround tag.
 - The package has no device claim.  It is `host`.
 
+This release requires novo 0.23.0 or later.
+
+## 0.0.4 — 2026-10-28
+
+The dependency requirement is raised: `prompt-nv` from ^0.0.1 to ^0.0.3, `tokenizers-nv` from ^0.0.1 to ^0.0.3, `http-codec-nv` from ^0.0.2 to ^0.1.0.  The newest version of each builds with no migration warning under the 0.22.0 compiler, and the older one drew E2050, E2052 or E2055 warnings into this package's build.  No signature and no behaviour changed.
+
 ## 0.0.3 — 2026-09-28
 
 The dependency ranges move to the releases published on 2026-09-28:
